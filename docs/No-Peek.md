@@ -201,6 +201,28 @@ python main.py --weights weights/yolov8n-face.onnx --source 0
 
 ## 6. Metodologi eksperimen
 
+### Catatan implementasi pada checkout ini — eksperimen YOLO pertama
+
+Atas pilihan eksperimen proyek, implementasi saat ini memulai dengan **YOLOv8n-Face
+ONNX** dari `model/yolov8n-face.onnx`. YuNet tetap menjadi baseline pembanding pada
+rancangan, tetapi file prototipe lama `antikepo_yunet.py` yang disebut di bagian 5
+tidak tersedia pada checkout ini. Status bagian 5 menjelaskan prototipe sebelumnya,
+bukan bukti bahwa fitur tersebut telah tersedia dalam source tree saat ini.
+
+Entry point eksperimen sekarang adalah `uv run no-peek`. Sumbernya dapat berupa
+webcam (`--camera 0`) atau video (`--video path.mp4`), dengan preview OpenCV,
+bounding box, lima landmark, analisis per track, timer 2/7 detik, dan panel statistik.
+Pause, seek, frame stepping, replay, dan kecepatan playback tersedia untuk video.
+Seluruh kontrol, format data JSONL opsional, serta batas analisis dijelaskan di
+[README](../README.md#eksperimen-webcam-dan-video).
+
+Orientasi saat ini hanya **roll garis mata dan frontal proxy lima landmark**.
+Yaw/pitch/gaze presisi, BR-06 unattended, toast native, dan evaluasi accuracy/recall
+berdasarkan ground truth belum diimplementasikan. Hilangnya owner melewati grace
+period membatalkan kalibrasi; ID spasial bukan pengenalan identitas. Seek/replay
+mereset track dan timer, sedangkan timestamp video mengikuti waktu media, bukan
+waktu yang dihabiskan saat playback/pause.
+
 ### 6.1 Desain pengujian
 
 Uji tiga tahapan secara berurutan supaya waktu tidak habis pada kombinasi yang belum diperlukan.
