@@ -1,124 +1,134 @@
 # No-Peek
-Sistem Deteksi Pengintip Layar (Shoulder Surfing) Menggunakan Computer Vision Secara Real-Time. Supported on Mac &amp; Windows
 
-## Eksperimen webcam dan video
+**Sistem Deteksi Pengintip Layar (*Shoulder Surfing*) Real-Time Menggunakan Computer Vision Lokal.**  
+Didukung pada **Windows** dan **macOS** — 100% pemrosesan lokal tanpa pengiriman gambar ke *cloud*.
 
-Tahap ini berupa preview eksperimen OpenCV, mengikuti [rancangan teknis](docs/No-Peek.md).
-Eksperimen pertama memakai YOLOv8n-Face sesuai pilihan proyek; keputusan model
-akhir masih memerlukan pembandingan dengan baseline YuNet di dokumen.
+---
 
-### Persiapan di macOS
+## Fitur Utama
 
-```sh
+1. **Two-Stage Computer Vision Pipeline:**
+   * **Tahap 1 — Deteksi Multi-Wajah Cepat (`YOLOv8n-Face` ONNX):** Mendeteksi *bounding box* dan 5 titik *landmark* dasar wajah secara lokal di CPU menggunakan `onnxruntime` dan C++ NMS OpenCV.
+   * **Tahap 2 — Estimasi Head Pose 3D (`MediaPipe Face Landmarker`):** Menghitung matriks transformasi 3D wajah untuk memperoleh sudut rotasi kepala presisi dalam derajat:
+     * **Yaw** (menoleh kiri–kanan, default $|\text{yaw}| < 35^\circ$)
+     * **Pitch** (mendongak–menunduk, default $|\text{pitch}| < 25^\circ$)
+     * **Roll** (kemiringan kepala, default $|\text{roll}| < 35^\circ$)
+2. **Estimasi Jarak Kamera ke Wajah (`distance_cm`):**
+   * Menggunakan *Pinhole Camera Model* dari kombinasi lebar kotak wajah dan jarak antar-mata (*Inter-Pupillary Distance*) yang dikompensasi terhadap sudut tolehan $\cos(|\text{yaw}|)$.
+3. **Auto-Kalibrasi `OWNER`:**
+   * Otomatis mengunci pengguna utama (`OWNER`) yang duduk di zona tengah layar ($25\%\text{–}75\%$ lebar frame), menghadap ke layar, dan berada paling dekat dengan kamera setelah stabil selama $\ge 0{,}6\text{ detik}$.
+   * Tetap mendukung kalibrasi manual kapan saja dengan tombol `C` atau *toggle* auto-kalibrasi dengan tombol `A`.
+4. **Klasifikasi Role Spasial (`OWNER`, `FRIEND`, `OBSERVER`):**
+   * **`OWNER` (Hijau):** Pengguna utama laptop.
+   * **`FRIEND` (Biru/Cyan):** Rekan/teman yang duduk **berdampingan (*side-by-side*)** sejajar dengan `OWNER` (termasuk toleransi variasi ukuran kepala yang lebih mungil saat duduk sejajar secara vertikal). Tidak memicu *alert*.
+   * **`OBSERVER` (Kuning/Merah/Ungu):** Wajah tambahan yang berada lebih jauh di belakang `OWNER` dan menghadap ke layar.
+5. **Mesin Aturan Temporal (Anti-False Alarm):**
+   * **`MONITORING` ($0\text{ s}$):** Kondisi aman atau pengamat sedang menoleh/menunduk.
+   * **`PENDING` ($< 2\text{ s}$):** Pengamat baru menghadap layar (belum memicu peringatan).
+   * **`ALERT` ($\ge 2\text{ s}$):** Pengamat menatap layar minimal 2 detik.
+   * **`ESCALATED` ($\ge 7\text{ s}$):** Pengamat tetap menatap layar selama 7 detik atau lebih.
+
+---
+
+## Struktur Modul (`Separation of Concerns`)
+
+```text
+No-Peek/
+├── docs/
+│   ├── No-Peek.md               # Dokumentasi pendekatan teknis & arsitektur
+│   └── No-Peek.pdf
+├── model/
+│   ├── yolov8n-face.onnx        # Model deteksi wajah (Tahap 1)
+│   └── face_landmarker.task     # Model MediaPipe 3D Head Pose (Tahap 2)
+├── src/no_peek/
+│   ├── source.py                # Akuisisi frame webcam/video & manajemen clock
+│   ├── detector.py              # Inferensi YOLOv8n-Face ONNX & C++ NMS
+│   ├── pose.py                  # Estimasi sudut 3D (yaw/pitch/roll) via MediaPipe
+│   ├── geometry.py              # Kalkulasi jarak (cm), zona tengah, & logika FRIEND
+│   ├── analysis.py              # Pelacakan IoU, auto-kalibrasi, & state machine risiko
+│   ├── preview.py               # Rendering UI preview & panel telemetri OpenCV
+│   └── main.py                  # CLI entry point & orkestrasi sesi
+└── tests/
+    ├── test_experiment.py       # Unit test decoder, geometri, head pose, & temporal
+    └── test_player.py           # Integrasi kontrol pemutar video & ekspor metrik
+```
+
+---
+
+## Instalasi
+
+Pastikan Python `>= 3.11` (direkomendasikan `3.12`) dan [`uv`](https://docs.astral.sh/uv/) telah terpasang:
+
+```bash
 uv sync
-# Bobot yang sudah diunduh:
-ls model/yolov8n-face.onnx
 ```
 
-Dependencies: OpenCV dengan HighGUI, NumPy, ONNX Runtime CPU. Tidak memerlukan
-CUDA atau PyTorch. Python lokal dipin ke 3.12 melalui `.python-version`.
-Jika kamera gagal dibuka, izinkan aplikasi Terminal/editor yang menjalankan
-program di **System Settings > Privacy & Security > Camera**, kemudian buka ulang
-terminal. Window dan input keyboard berjalan pada main thread untuk backend Cocoa.
+Atau menggunakan `venv` standar:
 
-### Webcam
+```powershell
+python -m venv .venv
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# macOS / Linux:
+# source .venv/bin/activate
 
-```sh
+pip install -e .
+```
+
+---
+
+## Cara Menjalankan
+
+### 1. Menggunakan Webcam Lokal
+```powershell
 uv run no-peek --camera 0
-# Kamera lain / preview tanpa mirror / eksperimen threshold:
-uv run no-peek --camera 1 --no-mirror --confidence 0.6 --threads 2
+# atau melalui python langsung:
+.\.venv\Scripts\python.exe -m no_peek.main --camera 0
 ```
 
-Akuisisi meminta 1280x720, 30 FPS; resolusi/FPS aktual ditampilkan karena kamera
-dapat memilih mode berbeda. Preview webcam di-mirror secara default. Data koordinat
-dan roll tetap dalam frame asli; label LEFT/RIGHT di preview mengikuti mirror.
-
-### Video player dengan overlay
-
-```sh
-uv run no-peek --video "/path/ke/video.mp4"
-uv run no-peek --video "/path/ke/video.mov" --metrics experiments/video-01.jsonl
+### 2. Evaluasi Menggunakan File Video & Ekspor Metrik JSONL
+```powershell
+uv run no-peek --video sample.mp4 --metrics experiments/run1.jsonl
 ```
 
-Video diproses frame demi frame, tanpa audio. Kecepatan tampilan mengikuti FPS
-file sejauh CPU mampu; inference yang lambat memperlambat playback tanpa membuang
-frame. Timer risiko memakai timestamp media (`frame_index / fps`), sehingga pause
-dan perubahan kecepatan playback tidak memperpanjang durasi risiko. Ini mengasumsikan
-video constant frame rate; konversi video variable frame rate ke CFR untuk evaluasi
-waktu yang presisi.
+### 3. Opsi Argumen CLI
+| Argumen | Default | Keterangan |
+| :--- | :--- | :--- |
+| `--camera` | `0` | Indeks webcam lokal |
+| `--video` | `None` | Path file video lokal (menggantikan webcam) |
+| `--model` | `model/yolov8n-face.onnx` | Path model detektor wajah ONNX |
+| `--pose-model` | `model/face_landmarker.task` | Path model MediaPipe Face Landmarker |
+| `--confidence` | `0.5` | Ambang skor deteksi wajah `(0, 1]` |
+| `--iou` | `0.45` | Ambang IoU untuk Non-Maximum Suppression |
+| `--max-yaw` | `35.0` | Ambang mutlak sudut tolehan horizontal (`derajat`) |
+| `--max-pitch` | `25.0` | Ambang mutlak sudut anggukan vertikal (`derajat`) |
+| `--max-roll` | `35.0` | Ambang mutlak kemiringan kepala (`derajat`) |
+| `--fov` | `60.0` | *Field of View* horizontal kamera untuk estimasi jarak |
+| `--friend-margin-cm` | `25.0` | Toleransi selisih jarak belakang `OWNER` (cm) untuk `FRIEND` |
+| `--auto-calibrate` / `--no-auto-calibrate` | `--auto-calibrate` | Aktifkan/nonaktifkan auto-kalibrasi `OWNER` |
+| `--mirror` / `--no-mirror` | Otomatis | *Mirror* tampilan preview (default aktif pada webcam) |
+| `--headless` | `False` | Jalankan tanpa jendela GUI untuk pemrosesan *batch* |
+| `--metrics` | `None` | Simpan log telemetri per frame ke berkas `.jsonl` |
 
-| Kontrol | Perilaku |
-|---|---|
-| `C` | Kalibrasi owner; harus tepat satu wajah terlihat |
-| `R` | Reset track, owner, dan timer |
-| `M` | Toggle mirror preview |
-| `Space` | Pause/resume; di akhir video memulai replay |
-| `N` / `B` | Frame berikutnya / sebelumnya (video) |
-| `J` / `L` | Mundur/maju 5 detik (video) |
-| `0` | Ulang dari awal video |
-| `+` / `-` | Kecepatan playback 0.25x sampai 4x |
-| Slider `Position` | Seek video |
-| `Q` / `Esc` / tutup window | Keluar dan melepaskan sumber |
+---
 
-Klik window preview agar tombol diterima. Seek/back/replay mereset kalibrasi dan
-timer supaya episode tidak melintasi lompatan waktu. Pause/resume webcam juga
-mereset kalibrasi karena waktu sumber live terus berjalan.
+## Pintasan Keyboard (Saat Jendela Preview Aktif)
 
-### Data yang terlihat dan diekspor
+* **`A`**: *Toggle* Auto-Kalibrasi `OWNER` (`ON` / `OFF`)
+* **`C`**: Kalibrasi `OWNER` secara manual (saat tepat 1 wajah terlihat)
+* **`R`**: Reset pelacakan dan status kalibrasi
+* **`M`**: *Toggle* tampilan *mirror* (cermin horizontal)
+* **`SPACE`**: *Pause* / *Resume* (atau *Replay* saat video selesai)
+* **`N` / `B`**: Maju / mundur 1 frame (khusus input file video)
+* **`J` / `L`**: Mundur / maju 5 detik (khusus input file video)
+* **`+` / `-`**: Percepat / perlambat kecepatan pemutaran video
+* **`0`**: Ulangi video dari frame awal
+* **`Q` / `ESC`**: Keluar dari aplikasi
 
-- Bounding box xyxy, confidence dan lima titik: dua mata, hidung, dua sudut mulut.
-- ID track sementara, role owner/observer, posisi, proporsi area wajah, risk timer.
-- Status `UNCALIBRATED`, `MONITORING`, `PENDING`, `ALERT` (2s), `ESCALATED` (7s).
-- Roll garis mata dalam derajat dan offset hidung relatif terhadap jarak mata.
-- FPS pemrosesan (capture+deteksi+analisis, sebelum render/playback wait), waktu
-  preprocessing/inference/postprocessing, inference median/p95 pada 300 frame terakhir.
-- Panel merinci tiga wajah pertama berdasarkan confidence; seluruh deteksi tetap
-  digambar dan diekspor. Detektor membatasi hasil ke 50 wajah per frame.
+---
 
-`--metrics path.jsonl` menyimpan metadata sesi, data tiap frame, event alert,
-kalibrasi/reset/seek, serta ringkasan. Box dan landmark memakai piksel frame asli.
-File dibuat baru; path yang sudah ada ditolak agar hasil eksperimen tidak tertimpa.
-Tidak ada frame, foto, audio, atau identitas biometrik disimpan. Default tanpa log.
+## Menjalankan Unit Test
 
-**Batas analisis:** model ini belum memberi yaw/pitch atau gaze. Roll berasal dari
-garis mata, sedangkan `frontal_proxy` adalah heuristik `abs(nose_offset)<0.3` dan
-`abs(roll)<35°`; keduanya belum dikalibrasi sebagai head pose presisi. Wajah observer
-harus memiliki area minimal 0.15% frame agar masuk timer. ID menggunakan matching
-IoU satu-ke-satu (ambang 0.25), dengan grace period 250ms. Occlusion, perpindahan
-cepat, atau wajah saling melintas masih dapat memutus/menukar ID. Hilangnya owner
-melewati grace period membatalkan kalibrasi; BR-06 unattended belum diaktifkan karena
-tracking spasial tidak membuktikan identitas. Alert muncul di preview dan console
-satu kali per transisi; belum berupa toast OS.
-
-Confidence detector adalah skor model, bukan akurasi eksperimen. Event precision,
-recall dan false alert/jam memerlukan anotasi ground truth dan belum dihitung oleh
-player ini. FPS/latensi harus diukur pada video dan perangkat target; hasil satu
-fixture tidak membuktikan target 15–20 FPS atau kualitas shoulder-surfing detection.
-
-### Evaluasi tanpa window
-
-```sh
-uv run no-peek --video "/path/video.mp4" --headless --metrics experiments/batch-01.jsonl
-uv run no-peek --video "/path/video.mp4" --headless --max-frames 30
-uv run python -m unittest discover -s tests -v
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
-
-Mode headless memproses video secepat CPU dan tidak menyediakan kalibrasi interaktif,
-sehingga cocok untuk evaluasi detektor/performa. Preview interaktif diperlukan untuk
-eksperimen owner dan alert. Keluar dengan Ctrl+C jika perlu.
-
-### Pembagian kode
-
-| File | Input → output |
-|---|---|
-| `src/no_peek/detector.py` | Frame BGR → deteksi di koordinat asli + waktu tiap tahap |
-| `src/no_peek/analysis.py` | Deteksi + timestamp → track, proxy orientasi, timer/event |
-| `src/no_peek/source.py` | Kamera/file → frame BGR, index, timestamp dan metadata |
-| `src/no_peek/preview.py` | Frame + analisis + statistik → canvas overlay dan panel |
-| `src/no_peek/main.py` | Argumen CLI dan keyboard → loop eksperimen + JSONL opsional |
-
-Format model diverifikasi terhadap [implementasi YOLOv8-Face upstream](https://github.com/yakhyo/yolov8-face-onnx-inference).
-Bobot yang didukung mengeluarkan tiga feature maps `[1,80,H,W]` (DFL 16 bin,
-stride 8/16/32). Bobot YOLO generik/format export lain ditolak dengan pesan format.
-Input model dinamis memakai 640x640 sebagai baseline, dengan letterbox agar aspect
-ratio terjaga. Review lisensi kode dan bobot upstream sebelum distribusi.

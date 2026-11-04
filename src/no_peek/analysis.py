@@ -1,36 +1,20 @@
-"""Analisis eksperimen: tracking spasial, proxy orientasi, dan timer per wajah.
-
-ID bukan identitas biometrik. Sesudah owner hilang melebihi grace period,
-kalibrasi dibatalkan agar ID baru tidak otomatis dianggap owner/observer.
-"""
+"""Analisis eksperimen: tracking spasial, auto-kalibrasi owner, klasifikasi FRIEND/OBSERVER, dan timer risiko."""
 
 from dataclasses import dataclass
-from math import atan2, degrees
 
 import numpy as np
 
 from no_peek.detector import Face
+from no_peek.geometry import (
+    estimate_distance_cm,
+    horizontal_zone,
+    intersection_over_union,
+    is_center_zone,
+    is_side_by_side_friend,
+    orientation,
+)
 
-
-def orientation(points: np.ndarray) -> dict:
-    """Input lima landmark xy; output roll garis mata dan proxy frontal (bukan gaze/yaw/pitch)."""
-    eyes = points[:2][np.argsort(points[:2, 0])]
-    vector = eyes[1] - eyes[0]
-    length = float(np.linalg.norm(vector))
-    if length < 3:
-        return {"roll_deg": None, "nose_offset": None, "frontal_proxy": False}
-    # Proyeksi hidung pada sumbu mata mengurangi pengaruh kemiringan kepala.
-    offset = float(np.dot(points[2] - eyes.mean(axis=0), vector / length) / length)
-    roll = degrees(atan2(float(vector[1]), float(vector[0])))
-    return {"roll_deg": roll, "nose_offset": offset,
-            "frontal_proxy": abs(offset) < 0.3 and abs(roll) < 35}
-
-
-def intersection_over_union(first: np.ndarray, second: np.ndarray) -> float:
-    """Input dua box xyxy; output IoU [0,1] untuk pencocokan track."""
-    intersection = np.prod(np.maximum(np.minimum(first[2:], second[2:]) - np.maximum(first[:2], second[:2]), 0))
-    areas = np.prod(first[2:] - first[:2]) + np.prod(second[2:] - second[:2])
-    return float(intersection / max(areas - intersection, 1e-9))
+__all__ = ["Analyzer", "Track", "intersection_over_union", "orientation"]
 
 
 @dataclass
@@ -40,16 +24,36 @@ class Track:
     identifier: int
     face: Face
     last_seen: float
+    distance_cm: float = 0.0
     risk_since: float | None = None
     state: str = "MONITORING"
 
 
 class Analyzer:
-    """Eksperimen aturan 2s/7s, grace period 250ms, dan kalibrasi owner eksplisit."""
+    """Aturan 2s/7s, grace 250ms, auto/manual kalibrasi owner, dan klasifikasi berdampingan (FRIEND)."""
 
-    def __init__(self, grace: float = 0.25):
-        """Input toleransi missed detection (detik); output state tracking kosong."""
+    def __init__(
+        self,
+        grace: float = 0.25,
+        max_yaw: float = 35.0,
+        max_pitch: float = 25.0,
+        max_roll: float = 35.0,
+        auto_calibrate: bool = True,
+        auto_calibrate_s: float = 0.6,
+        fov_deg: float = 60.0,
+        friend_margin_cm: float = 25.0,
+        max_friend_dist_cm: float = 115.0,
+    ):
+        """Input parameter tracking, sudut, auto-kalibrasi, dan jarak; output state siap pakai."""
         self.grace = grace
+        self.max_yaw = max_yaw
+        self.max_pitch = max_pitch
+        self.max_roll = max_roll
+        self.auto_calibrate = auto_calibrate
+        self.auto_calibrate_s = auto_calibrate_s
+        self.fov_deg = fov_deg
+        self.friend_margin_cm = friend_margin_cm
+        self.max_friend_dist_cm = max_friend_dist_cm
         self.reset()
 
     def reset(self) -> None:
@@ -58,30 +62,71 @@ class Analyzer:
         self.next_id = 1
         self.owner: int | None = None
         self.calibrated = False
+        self.calibration_mode: str | None = None
+        self.candidate_id: int | None = None
+        self.candidate_since: float | None = None
         self.events: list[dict] = []
 
     def calibrate(self, visible_ids: list[int]) -> str:
-        """Input ID yang terlihat sekarang; output pesan kalibrasi (tepat satu wajah wajib)."""
+        """Input ID yang terlihat sekarang; output pesan kalibrasi manual (tepat satu wajah wajib)."""
         if len(visible_ids) != 1:
             return "Kalibrasi gagal: harus tepat 1 wajah terlihat."
         self.owner = visible_ids[0]
         self.calibrated = True
+        self.calibration_mode = "MANUAL"
+        self.candidate_id, self.candidate_since = None, None
         for track in self.tracks.values():
             track.risk_since, track.state = None, "MONITORING"
-        return f"Owner = ID {self.owner}. Tracking spasial, bukan face recognition."
+        return f"Owner = ID {self.owner} (MANUAL). Tracking spasial, bukan face recognition."
+
+    def toggle_auto_calibrate(self) -> str:
+        """Tanpa input; aktifkan/nonaktifkan auto-kalibrasi dan kembalikan pesan status."""
+        self.auto_calibrate = not self.auto_calibrate
+        self.candidate_id, self.candidate_since = None, None
+        state_label = "ON" if self.auto_calibrate else "OFF"
+        return f"Auto-calibrate = {state_label}."
+
+    def _try_auto_calibrate(
+        self,
+        visible_meta: list[tuple[int, Face, dict, float]],
+        now: float,
+        width: int,
+    ) -> None:
+        """Input metadata wajah terlihat; kunci OWNER otomatis bila kandidat tengah & dekat stabil."""
+        if self.calibrated or not self.auto_calibrate:
+            self.candidate_id, self.candidate_since = None, None
+            return
+        eligible = []
+        for key, face, pose, dist_cm in visible_meta:
+            if pose["frontal_proxy"] and dist_cm <= self.max_friend_dist_cm and is_center_zone(face.box, width):
+                center_x = float((face.box[0] + face.box[2]) / 2.0)
+                score = dist_cm * (1.0 + abs(center_x - width / 2.0) / max(1, width))
+                eligible.append((score, key))
+        if not eligible:
+            self.candidate_id, self.candidate_since = None, None
+            return
+        _, best_key = min(eligible)
+        if self.candidate_id != best_key or self.candidate_since is None:
+            self.candidate_id = best_key
+            self.candidate_since = now
+        if now - self.candidate_since >= self.auto_calibrate_s:
+            self.owner = best_key
+            self.calibrated = True
+            self.calibration_mode = "AUTO"
+            self.candidate_id, self.candidate_since = None, None
+            for track in self.tracks.values():
+                track.risk_since, track.state = None, "MONITORING"
+            self.events.append({"time_s": now, "id": best_key, "event": "AUTO_CALIBRATED"})
 
     def update(self, faces: list[Face], now: float, shape: tuple) -> list[dict]:
-        """Input deteksi, timestamp sumber, shape frame; output analisis wajah yang terlihat.
-
-        Matching satu-ke-satu berdasarkan IoU; track yang tak terlihat tidak
-        digambar. Risiko berlanjut hanya selama missed detection <= grace.
-        """
+        """Input deteksi, timestamp sumber, shape frame; output analisis wajah yang terlihat."""
         self.events = []
-        expired = [key for key, track in self.tracks.items() if now-track.last_seen > self.grace]
+        expired = [key for key, track in self.tracks.items() if now - track.last_seen > self.grace]
         for key in expired:
             del self.tracks[key]
             if key == self.owner:
-                self.calibrated, self.owner = False, None
+                self.calibrated, self.owner, self.calibration_mode = False, None, None
+
         candidates = sorted(
             ((intersection_over_union(track.face.box, face.box), key, index)
              for key, track in self.tracks.items() for index, face in enumerate(faces)),
@@ -92,8 +137,9 @@ class Analyzer:
             if overlap >= 0.25 and key not in used and index not in assignments:
                 assignments[index] = key
                 used.add(key)
-        result = []
+
         height, width = shape[:2]
+        visible_meta: list[tuple[int, Face, dict, float]] = []
         for index, face in enumerate(faces):
             key = assignments.get(index)
             if key is None:
@@ -101,10 +147,30 @@ class Analyzer:
                 self.next_id += 1
                 self.tracks[key] = Track(key, face, now)
             track = self.tracks[key]
-            track.face, track.last_seen = face, now
-            pose = orientation(face.landmarks)
-            area_ratio = float(np.prod(face.box[2:]-face.box[:2]) / (width*height))
-            role = "OWNER" if key == self.owner else "OBSERVER" if self.calibrated else "UNCALIBRATED"
+            pose = orientation(face.landmarks, face.pose, self.max_yaw, self.max_pitch, self.max_roll)
+            dist_cm = estimate_distance_cm(face.box, face.landmarks, width, pose["yaw_deg"], self.fov_deg)
+            track.face, track.last_seen, track.distance_cm = face, now, dist_cm
+            visible_meta.append((key, face, pose, dist_cm))
+
+        self._try_auto_calibrate(visible_meta, now, width)
+        owner_track = self.tracks.get(self.owner) if self.calibrated and self.owner is not None else None
+
+        result = []
+        for key, face, pose, dist_cm in visible_meta:
+            track = self.tracks[key]
+            area_ratio = float(np.prod(face.box[2:] - face.box[:2]) / (width * height))
+            if key == self.owner:
+                role = "OWNER"
+            elif not self.calibrated:
+                role = "UNCALIBRATED"
+            elif owner_track is not None and is_side_by_side_friend(
+                face.box, dist_cm, owner_track.face.box, owner_track.distance_cm,
+                self.friend_margin_cm, self.max_friend_dist_cm,
+            ):
+                role = "FRIEND"
+            else:
+                role = "OBSERVER"
+
             qualifies = role == "OBSERVER" and pose["frontal_proxy"] and area_ratio >= 0.0015
             previous = track.state
             if qualifies:
@@ -116,9 +182,18 @@ class Analyzer:
                 track.risk_since, track.state, elapsed = None, "MONITORING", 0.0
             if track.state != previous and track.state in ("ALERT", "ESCALATED"):
                 self.events.append({"time_s": now, "id": key, "event": track.state})
-            center_x = float((face.box[0] + face.box[2]) / 2)
-            position = "LEFT" if center_x < width/3 else "RIGHT" if center_x > width*2/3 else "CENTER"
-            result.append({"id": key, "role": role, "state": track.state, "risk_s": elapsed,
-                           "position": position, "area_ratio": area_ratio, "confidence": face.score,
-                           "box": face.box.tolist(), "landmarks": face.landmarks.tolist(), **pose})
+            position = horizontal_zone(face.box, width)
+            result.append({
+                "id": key,
+                "role": role,
+                "state": track.state,
+                "risk_s": elapsed,
+                "distance_cm": dist_cm,
+                "position": position,
+                "area_ratio": area_ratio,
+                "confidence": face.score,
+                "box": face.box.tolist(),
+                "landmarks": face.landmarks.tolist(),
+                **pose,
+            })
         return result

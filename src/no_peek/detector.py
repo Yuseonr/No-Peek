@@ -20,6 +20,7 @@ class Face:
     box: np.ndarray  # shape (4,), x1, y1, x2, y2
     score: float
     landmarks: np.ndarray  # shape (5, 2): dua mata, hidung, dua sudut mulut
+    pose: dict[str, float] | None = None
 
 
 def letterbox(frame: np.ndarray, size: tuple[int, int]) -> tuple[np.ndarray, float, tuple[int, int]]:
@@ -31,25 +32,20 @@ def letterbox(frame: np.ndarray, size: tuple[int, int]) -> tuple[np.ndarray, flo
     left, top = (target_w - resized_w) // 2, (target_h - resized_h) // 2
     canvas = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
     canvas[top:top + resized_h, left:left + resized_w] = cv2.resize(frame, (resized_w, resized_h))
-    tensor = canvas[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
-    return np.ascontiguousarray(tensor), scale, (left, top)
+    tensor = cv2.dnn.blobFromImage(canvas, scalefactor=1.0 / 255.0, size=(target_w, target_h), swapRB=True, crop=False)
+    return tensor, scale, (left, top)
 
 
 def suppress_overlaps(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> list[int]:
-    """Input box xyxy, skor, ambang IoU; output indeks box yang lolos NMS."""
-    remaining = np.argsort(scores)[::-1]
-    selected: list[int] = []
-    areas = np.prod(np.maximum(boxes[:, 2:] - boxes[:, :2], 0), axis=1)
-    while remaining.size:
-        index = int(remaining[0])
-        selected.append(index)
-        others = remaining[1:]
-        intersection = np.prod(np.maximum(
-            np.minimum(boxes[index, 2:], boxes[others, 2:])
-            - np.maximum(boxes[index, :2], boxes[others, :2]), 0), axis=1)
-        overlap = intersection / np.maximum(areas[index] + areas[others] - intersection, 1e-9)
-        remaining = others[overlap <= threshold]
-    return selected
+    """Input box xyxy, skor, ambang IoU; output indeks box yang lolos NMS via OpenCV C++."""
+    if boxes.size == 0 or scores.size == 0:
+        return []
+    widths_heights = np.maximum(boxes[:, 2:] - boxes[:, :2], 0.0)
+    bboxes_xywh = np.column_stack((boxes[:, :2], widths_heights)).tolist()
+    indices = cv2.dnn.NMSBoxes(bboxes_xywh, scores.tolist(), score_threshold=0.0, nms_threshold=float(threshold))
+    if len(indices) == 0:
+        return []
+    return [int(i) for i in np.asarray(indices).reshape(-1)]
 
 
 def decode_maps(outputs: list[np.ndarray], confidence: float) -> np.ndarray:

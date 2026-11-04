@@ -8,13 +8,13 @@
 |---|---|
 | Jenis dokumen | Laporan rancangan sistem, pemilihan model, dan rencana eksperimen |
 | Target produk | Aplikasi desktop ringan, offline, dapat diinstal di Windows dan macOS |
-| Teknologi awal | Python, OpenCV, YuNet ONNX, MediaPipe (opsional), PySide6 |
-| Tanggal | 2 November 2026 |
-| Dasar | Dokumen Studi Kasus & Business Rules Anti-Kepo dan prototipe YuNet |
+| Teknologi | Python, OpenCV, YOLOv8n-Face ONNX, MediaPipe Face Landmarker, PySide6 |
+| Tanggal | 4 November 2026 |
+| Dasar | Dokumen Studi Kasus & Business Rules Anti-Kepo serta implementasi Two-Stage Pipeline |
 
 ## Ringkasan keputusan
 
-**Baseline: YuNet.** Pertahankan YOLOv8-Face sebagai pembanding, bukan pilihan langsung. Pisahkan deteksi wajah, pengenalan pengguna utama secara spasial, pemeriksaan orientasi kepala, dan pemicu berbasis waktu. Validasi pada skenario nyata sebelum membangun antarmuka aplikasi penuh.
+**Detektor & Head Pose: YOLOv8n-Face ONNX + MediaPipe Face Landmarker.** Sistem menggunakan arsitektur *two-stage pipeline*: YOLOv8n-Face mendeteksi multi-wajah dan 5 *landmark* dasar, diikuti MediaPipe Face Landmarker untuk menghitung matriks transformasi 3D (*yaw*, *pitch*, *roll*). Dilengkapi estimasi jarak fisik (`distance_cm`), auto-kalibrasi *owner* di zona tengah, serta klasifikasi `FRIEND` untuk rekan yang duduk berdampingan.
 
 **Tiga prinsip desain:**
 
@@ -76,25 +76,25 @@ Pemilihan berdasarkan data lokal yang sama: **recall wajah pengamat**, **false p
 
 ```mermaid
 flowchart TD
-    A["Webcam lokal<br/>Pengambilan frame 720p"]
-    B["Detektor wajah<br/>YuNet ONNX atau YOLO-Face"]
-    C["Kalibrasi owner dan pelacakan calon pengamat<br/>ID sementara tanpa identitas biometrik"]
-    D["Filter posisi dan orientasi<br/>Proxy awal, head pose bila diperlukan"]
-    E["Risk engine temporal<br/>2 s peringatan, 7 s eskalasi, 3 s unattended"]
-    F["System tray dan toast/overlay non-intrusif<br/>Privacy Log opsional"]
+    A["Webcam / Video lokal<br/>Pengambilan frame 720p (source.py)"]
+    B["Tahap 1: Detektor wajah<br/>YOLOv8n-Face ONNX + C++ NMS (detector.py)"]
+    C["Tahap 2: Head Pose 3D<br/>MediaPipe Face Landmarker yaw/pitch/roll (pose.py)"]
+    D["Geometri spasial & jarak<br/>Estimasi distance_cm & deteksi berdampingan (geometry.py)"]
+    E["Auto-kalibrasi OWNER, klasifikasi FRIEND/OBSERVER,<br/>& Risk Engine Temporal 2s/7s (analysis.py)"]
+    F["Preview HighGUI / System tray & toast non-intrusif<br/>(preview.py / GUI)"]
     A --> B --> C --> D --> E --> F
 ```
 
-*Gambar 1. Arsitektur modular Anti-Kepo. Seluruh pemrosesan frame berlangsung pada perangkat pengguna.*
+*Gambar 1. Arsitektur modular Anti-Kepo (No-Peek). Seluruh pemrosesan frame berlangsung pada perangkat pengguna.*
 
 ### 3.1 Peran setiap modul
 
-- **Acquisition:** OpenCV `VideoCapture` mengambil frame dan menangani kegagalan akses kamera. Resolusi aktual diverifikasi setelah kamera dibuka.
-- **Detection:** YuNet menghasilkan $(x,y,w,h)$, skor keyakinan, dan lima landmark.
-- **Owner tracking:** Pengguna menekan tombol kalibrasi ketika hanya satu wajah ada. Sesi mempertahankan posisi owner secara temporal.
-- **Pose filter:** Wajah lain yang mengarah ke kamera menjadi kandidat, bukan langsung pengintip.
-- **Temporal engine:** Status disimpan per wajah tambahan berdasarkan lintasan waktu.
-- **Notification:** GUI melakukan alert tanpa memindahkan fokus dan tanpa menyembunyikan layar.
+- **Acquisition (`source.py`):** OpenCV `VideoCapture` mengambil frame dari webcam atau file video, serta mengelola jam monotonik/media.
+- **Detection (`detector.py`):** YOLOv8n-Face ONNX menghasilkan $(x_1,y_1,x_2,y_2)$, skor keyakinan, dan lima landmark dengan C++ NMS (`cv2.dnn.NMSBoxes`).
+- **Head Pose 3D (`pose.py`):** MediaPipe Face Landmarker menghitung matriks transformasi 3D wajah pada *square crop* untuk mengekstrak sudut `yaw_deg`, `pitch_deg`, dan `roll_deg`.
+- **Spatial Geometry (`geometry.py`):** Menghitung estimasi jarak kamera ke wajah (`distance_cm`) menggunakan *Pinhole Camera Model* terkoreksi sudut *yaw*, memeriksa zona tengah, dan mengevaluasi apakah wajah lain duduk berdampingan (`FRIEND`).
+- **Owner Tracking & Temporal Engine (`analysis.py`):** Mengelola auto-kalibrasi `OWNER` saat pengguna duduk stabil di zona tengah ($\ge 0{,}6\text{ s}$) maupun kalibrasi manual (`C`), membedakan `OWNER`, `FRIEND`, dan `OBSERVER`, serta menjalankan aturan waktu peringatan 2 detik (`ALERT`) dan 7 detik (`ESCALATED`).
+- **Notification / Preview (`preview.py`):** Menampilkan antarmuka visual dan panel telemetri (serta lapisan notifikasi desktop non-intrusif pada tahap GUI).
 
 ### 3.2 Kesalahan yang harus diantisipasi
 
@@ -107,22 +107,29 @@ flowchart TD
 
 | Rule | Kondisi utama | Ambang | Aksi yang dirancang |
 |---|---|---|---|
-| BR-01 | Tidak ada kandidat yang memenuhi risiko | Kontinu | Status aman atau monitoring; tanpa alert. |
-| BR-02 | Orang tambahan lewat atau belum menetap | < 2 s | Abaikan; timer tidak menghasilkan notifikasi. |
-| BR-03 | Observer stabil, orientasi memenuhi syarat | ≥ 2 s | Tampilkan toast dan indikator kiri/tengah/kanan. |
-| BR-04 | Observer berisiko tetap ada | ≥ 7 s | Eskalasi visual halus; bunyi/log opsional. |
-| BR-05 | Observer menyamping atau membelakangi kamera | Kontinu | Abaikan sebagai kandidat risiko. |
+| BR-01 | Tidak ada kandidat yang memenuhi risiko (hanya `OWNER` / `FRIEND`) | Kontinu | Status aman atau `MONITORING`; tanpa alert. |
+| BR-02 | `OBSERVER` lewat atau belum menetap | < 2 s | Status `PENDING`; timer belum menghasilkan notifikasi. |
+| BR-03 | `OBSERVER` stabil, orientasi 3D memenuhi syarat | ≥ 2 s | Status `ALERT`; tampilkan indikator kiri/tengah/kanan. |
+| BR-04 | `OBSERVER` berisiko tetap menghadap layar | ≥ 7 s | Status `ESCALATED`; eskalasi visual halus, bunyi/log opsional. |
+| BR-05 | Wajah menyamping ($|\text{yaw}| \ge 35^\circ$) atau menunduk/mendongak ($|\text{pitch}| \ge 25^\circ$) | Kontinu | Abaikan sebagai kandidat risiko; timer direset ke 0. |
 | BR-06 | Owner tidak terlihat dan wajah asing muncul | ≥ 3 s | Alert *unattended screen*; butuh validasi khusus. |
+| BR-07 | Wajah kedua duduk berdampingan (*side-by-side*) sejajar dengan `OWNER` | Kontinu | Klasifikasikan sebagai `FRIEND`; abaikan dari perhitungan risiko. |
 
-*Ringkasan BR-01 hingga BR-06 berdasarkan dokumen proyek. Implementasi final memerlukan pengujian threshold.*
+*Ringkasan BR-01 hingga BR-07 berdasarkan dokumen proyek dan pengembangan aturan spasial.*
 
-### 4.1 Orientasi dan posisi
+### 4.1 Orientasi, estimasi jarak, dan klasifikasi `FRIEND`
 
-Definisikan luas wajah:
+Panjang fokus kamera ($f_{\text{px}}$) dihitung dari lebar frame $W$ dan *Field of View* horizontal ($\text{FoV} \approx 60^\circ$):
 
-$$A_i = w_i h_i$$
+$$f_{\text{px}} = \frac{W / 2}{\tan(\text{FoV} / 2)}$$
 
-Luas saja tidak dapat mengukur jarak fisik karena ukuran kepala dan perspektif berbeda. Untuk UI, posisi horizontal wajah dihitung dari pusat:
+Estimasi jarak wajah ke kamera ($\text{distance\_cm}$) menggabungkan lebar kotak wajah ($W_{\text{face}} \approx 15\text{ cm}$) dan jarak piksel antar-mata ($\text{IPD} \approx 6{,}3\text{ cm}$) yang dikompensasi terhadap penyempitan perspektif saat kepala menoleh sebesar sudut $\text{yaw}$:
+
+$$d_{\text{eyes, corr}} = \frac{d_{\text{eyes}}}{\max(\cos(|\text{yaw}|), 0{,}5)}, \quad \text{distance\_cm} = 0{,}6\left(\frac{15{,}0 \cdot f_{\text{px}}}{w_i}\right) + 0{,}4\left(\frac{6{,}3 \cdot f_{\text{px}}}{d_{\text{eyes, corr}}}\right)$$
+
+Wajah non-owner diklasifikasikan sebagai **`FRIEND`** (bukan `OBSERVER`) apabila berada dalam jarak duduk meja ($\le 115\text{ cm}$), bersebelahan secara horizontal dengan `OWNER`, memiliki ketinggian vertikal yang sejajar duduk (tidak melongok dari atas pundak), serta memiliki jarak sejajar ($\le d_{\text{owner}} + 25\text{ cm}$ atau toleransi ukuran kepala lebih mungil hingga $1{,}65\times d_{\text{owner}}$ saat duduk sejajar).
+
+Untuk UI, posisi horizontal wajah dihitung dari pusat:
 
 $$c_{x,i} = x_i + \frac{w_i}{2}$$
 
@@ -132,7 +139,7 @@ $$c_{x,i} = x_i + \frac{w_i}{2}$$
 
 Posisi ini relatif terhadap frame kamera; pada preview yang di-*mirror*, label harus konsisten dengan tampilan pengguna.
 
-Dalam dokumen awal, BR-05 mengabaikan wajah yang menoleh lebih dari sekitar $45^\circ$. Untuk tahap lanjutan, *yaw/pitch* dapat diperkirakan menggunakan MediaPipe Face Landmarker dan matriks transformasi; ambang sudut harus dikalibrasi karena tidak identik dengan arah mata [3]. Sebagai referensi implementasi, proyek *peeker* memakai $|yaw| < 35^\circ$, $|pitch| < 25^\circ$ dan durasi 1 detik. Angka tersebut hanya baseline eksperimen, bukan bukti terbaik untuk Anti-Kepo [7].
+Sudut orientasi kepala 3D (*yaw*, *pitch*, *roll*) diekstrak dari matriks transformasi $4 \times 4$ MediaPipe Face Landmarker melalui dekomposisi $R = R_y(\text{yaw}) R_x(\text{pitch}) R_z(\text{roll})$ dengan ambang default $|\text{yaw}| < 35^\circ$, $|\text{pitch}| < 25^\circ$, dan $|\text{roll}| < 35^\circ$ (fallback ke *5-point proxy* apabila *mesh* tidak terdeteksi).
 
 ### 4.2 Perilaku temporal yang disarankan
 
@@ -148,80 +155,46 @@ flowchart LR
 
 Satu observer yang hilang sesaat tidak langsung dianggap orang baru; gunakan *grace period* yang diuji. Setelah risiko hilang secara stabil, episode ditutup. Alert dipicu sekali per episode agar tidak terjadi spam.
 
-## 5. Prototipe awal dan cara mereproduksi
+## 5. Status implementasi saat ini dan cara mereproduksi
 
-### 5.1 Status pembuktian saat laporan dibuat
+### 5.1 Status pembuktian pada repositori saat ini
 
-| Komponen | Status | Batasan bukti |
+| Komponen | Status | Keterangan |
 |---|---|---|
-| Kode prototipe YuNet | **Tersedia** | Deteksi banyak wajah, kalibrasi spasial, proxy frontal, event 2 s dan 7 s. |
-| Pengujian sintaks dan timer | **Terbatas** | Sudah dilakukan uji non-kamera pada prototipe sebelumnya; bukan bukti performa lapangan. |
-| Akurasi pada jarak 0,8 sampai 2,5 m | **Belum diuji** | Perlu data webcam nyata pada beberapa skenario. |
-| Head pose presisi dan gaze | **Belum ada** | Proxy lima landmark bukan estimasi gaze. |
-| Overlay dan installer desktop | **Direncanakan** | Belum ada aplikasi produksi yang siap dipasang. |
+| Detektor YOLOv8n-Face ONNX (`detector.py`) | **Tersedia** | Deteksi multi-wajah, 5 landmark, `cv2.dnn.blobFromImage` & C++ NMS `cv2.dnn.NMSBoxes`. |
+| Head Pose 3D MediaPipe (`pose.py`) | **Tersedia** | Ekstraksi sudut `yaw_deg`, `pitch_deg`, `roll_deg` dari matriks transformasi 3D wajah. |
+| Estimasi jarak & Geometri `FRIEND` (`geometry.py`) | **Tersedia** | Estimasi `distance_cm` terkoreksi *yaw* dan pembedaan `FRIEND` (berdampingan) vs `OBSERVER`. |
+| Auto-kalibrasi & Temporal Engine (`analysis.py`) | **Tersedia** | Auto-kalibrasi `OWNER` di zona tengah ($\ge 0{,}6\text{ s}$), *grace period* 250 ms, event 2 s (`ALERT`) dan 7 s (`ESCALATED`). |
+| Pengujian unit & integrasi (`tests/`) | **Tersedia (16 test lulus)** | Mencakup uji decoder, matriks 3D, jarak, auto-kalibrasi, role `FRIEND`, dan kontrol video. |
+| Aplikasi GUI Desktop & Installer | **Tahap berikutnya** | Persiapan *scaffold* aplikasi GUI dan pengemasan lintas platform. |
 
-### 5.2 Yang sudah tersedia
+### 5.2 Menjalankan sistem
 
-Prototipe Python menggunakan YuNet ONNX versi 2023mar melalui OpenCV, dengan jendela preview. Parameter kode saat ini: confidence 0,75, NMS 0,3, filter luas wajah tambahan 0,15% dari luas frame, serta *frontal proxy* dari simetri mata dan hidung. Ini adalah nilai awal implementasi dan **belum** hasil optimasi.
+```powershell
+# Sinkronisasi environment dengan uv
+uv sync
 
-Fitur yang sudah ada adalah perhitungan wajah, kalibrasi owner dengan tombol `C`, posisi observer, event BR-03 pada 2 s, BR-04 pada 7 s, dan heuristik BR-06. Yang belum ada: estimasi gaze yang valid, UI toast native, log snapshot, dan pemaketan aplikasi. Track pada prototipe saat ini masih dapat terputus oleh satu *missed frame*; toleransi sementara menjadi pekerjaan berikutnya.
+# Menjalankan dengan webcam lokal
+uv run no-peek --camera 0
 
-### 5.3 Menjalankan YuNet
-
-```bash
-cd antikepo_poc
-python -m venv .venv
-
-# macOS:
-source .venv/bin/activate
-
-# Windows PowerShell:
-# .\.venv\Scripts\Activate.ps1
-
-python -m pip install -r requirements.txt
-python antikepo_yunet.py --camera 0
+# Menjalankan unit test
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Pada *run* pertama model dapat diunduh dari repositori resmi OpenCV di Hugging Face. Simpan model dengan installer untuk operasi *offline* penuh. Jalankan perizinan webcam pada OS sebelum pengujian. Tekan `C` saat sendiri, `R` untuk reset, dan `Q` untuk keluar.
-
-### 5.4 Percobaan YOLO-Face pembanding
-
-Repository *yakhyo/yolov8-face-onnx-inference* menyediakan bobot, script webcam, dan output lima landmark [2]. Konfigurasi CPU harus menggunakan `onnxruntime`, bukan `onnxruntime-gpu` yang memerlukan CUDA. Untuk rilis, pertimbangkan NumPy NMS sebagai pengganti TorchVision agar installer tidak membawa PyTorch. Verifikasi kesetaraan hasil inferensi.
-
-```bash
-git clone https://github.com/yakhyo/yolov8-face-onnx-inference.git
-cd yolov8-face-onnx-inference
-
-# Sesuaikan requirements untuk CPU sebelum instalasi.
-bash download.sh yolov8n-face
-python main.py --weights weights/yolov8n-face.onnx --source 0
-```
-
-**Perhatian lisensi:** Bobot pihak ketiga harus dicek secara spesifik sebelum distribusi. Tidak cukup hanya mengetahui bahwa format ONNX dapat dibaca secara lokal.
+Kontrol saat jendela preview aktif:
+- **`A`**: *Toggle* Auto-Kalibrasi `OWNER` (`ON`/`OFF`).
+- **`C`**: Kalibrasi `OWNER` manual saat tepat satu wajah terlihat.
+- **`R`**: Reset pelacakan dan kalibrasi.
+- **`M`**: *Toggle* mode cermin (*mirror*).
+- **`Q` / `ESC`**: Keluar dari program.
 
 ## 6. Metodologi eksperimen
 
-### Catatan implementasi pada checkout ini — eksperimen YOLO pertama
+### Catatan implementasi pada checkout ini
 
-Atas pilihan eksperimen proyek, implementasi saat ini memulai dengan **YOLOv8n-Face
-ONNX** dari `model/yolov8n-face.onnx`. YuNet tetap menjadi baseline pembanding pada
-rancangan, tetapi file prototipe lama `antikepo_yunet.py` yang disebut di bagian 5
-tidak tersedia pada checkout ini. Status bagian 5 menjelaskan prototipe sebelumnya,
-bukan bukti bahwa fitur tersebut telah tersedia dalam source tree saat ini.
+Implementasi pada repositori ini menggunakan pipeline dua tahap: **YOLOv8n-Face ONNX** (`model/yolov8n-face.onnx`) sebagai detektor wajah utama dan **MediaPipe Face Landmarker** (`model/face_landmarker.task`) untuk estimasi orientasi kepala 3D (`yaw`, `pitch`, `roll`), dengan *fallback* otomatis ke *5-point proxy* bila *mesh* wajah tidak terdeteksi.
 
-Entry point eksperimen sekarang adalah `uv run no-peek`. Sumbernya dapat berupa
-webcam (`--camera 0`) atau video (`--video path.mp4`), dengan preview OpenCV,
-bounding box, lima landmark, analisis per track, timer 2/7 detik, dan panel statistik.
-Pause, seek, frame stepping, replay, dan kecepatan playback tersedia untuk video.
-Seluruh kontrol, format data JSONL opsional, serta batas analisis dijelaskan di
-[README](../README.md#eksperimen-webcam-dan-video).
-
-Orientasi saat ini hanya **roll garis mata dan frontal proxy lima landmark**.
-Yaw/pitch/gaze presisi, BR-06 unattended, toast native, dan evaluasi accuracy/recall
-berdasarkan ground truth belum diimplementasikan. Hilangnya owner melewati grace
-period membatalkan kalibrasi; ID spasial bukan pengenalan identitas. Seek/replay
-mereset track dan timer, sedangkan timestamp video mengikuti waktu media, bukan
-waktu yang dihabiskan saat playback/pause.
+Entry point aplikasi adalah `uv run no-peek` (`no_peek.main:main`). Sumber input dapat berupa webcam (`--camera 0`) atau file video (`--video path.mp4`), dilengkapi estimasi jarak wajah (`distance_cm`), auto-kalibrasi `OWNER` di zona tengah layar, klasifikasi `FRIEND` untuk wajah yang duduk berdampingan, serta pencatatan telemetri JSONL opsional (`--metrics`). Detail lengkap argumen CLI dan struktur modul tersedia di [README](../README.md).
 
 ### 6.1 Desain pengujian
 
@@ -296,9 +269,9 @@ Jangan mengklaim pemenuhan target hanya berdasarkan satu demo. Ulangi setiap ske
 
 | Lapisan | Teknologi | Alasan |
 |---|---|---|
-| Capture dan deteksi | OpenCV + YuNet ONNX | Kode sederhana dan inferensi lokal. |
-| Pose (opsional) | MediaPipe Tasks | Landmark lebih rinci, matriks transformasi. |
-| State/rules | Python murni | Mudah diuji secara unit tanpa webcam. |
+| Capture dan deteksi | OpenCV + YOLOv8n-Face ONNX (`onnxruntime`) | Deteksi wajah & 5 landmark akurat tanpa dependensi PyTorch. |
+| Head Pose 3D | MediaPipe Tasks (`FaceLandmarker`) | Matriks transformasi wajah 3D untuk sudut `yaw`, `pitch`, dan `roll`. |
+| Geometri & State/rules | Python + NumPy (`geometry.py`, `analysis.py`) | Estimasi jarak `distance_cm`, auto-kalibrasi, role `FRIEND`, dan mudah diuji secara unit. |
 | Desktop GUI | PySide6 | System tray, toast/overlay, kontrol start/stop. |
 | Packaging | PyInstaller | Build bundle untuk Windows dan macOS secara terpisah [9]. |
 

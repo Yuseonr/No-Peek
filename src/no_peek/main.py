@@ -11,19 +11,27 @@ import numpy as np
 
 from no_peek.analysis import Analyzer
 from no_peek.detector import FaceDetector
+from no_peek.pose import DEFAULT_POSE_MODEL, HeadPoseEstimator
 from no_peek.preview import render
 from no_peek.source import FrameSource
 
 
 def arguments() -> argparse.Namespace:
     """Input argumen terminal; output konfigurasi tervalidasi untuk satu sesi eksperimen."""
-    parser = argparse.ArgumentParser(description="No-Peek: eksperimen webcam/video YOLOv8-Face lokal")
+    parser = argparse.ArgumentParser(description="No-Peek: eksperimen webcam/video YOLOv8-Face + MediaPipe Head Pose lokal")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--video", type=Path, help="File video lokal; tanpa opsi ini gunakan webcam")
     source.add_argument("--camera", type=int, default=0, help="Index webcam (default 0)")
     parser.add_argument("--model", type=Path, default=Path(__file__).resolve().parents[2]/"model/yolov8n-face.onnx")
+    parser.add_argument("--pose-model", type=Path, default=DEFAULT_POSE_MODEL, help="Model MediaPipe Face Landmarker (.task)")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--max-yaw", type=float, default=35.0, help="Ambang mutlak yaw derajat untuk menghadap layar (default 35)")
+    parser.add_argument("--max-pitch", type=float, default=25.0, help="Ambang mutlak pitch derajat untuk menghadap layar (default 25)")
+    parser.add_argument("--max-roll", type=float, default=35.0, help="Ambang mutlak roll derajat (default 35)")
+    parser.add_argument("--fov", type=float, default=60.0, help="FoV horizontal kamera derajat untuk estimasi jarak (default 60)")
+    parser.add_argument("--friend-margin-cm", type=float, default=25.0, help="Toleransi jarak belakang owner (cm) untuk role FRIEND (default 25)")
+    parser.add_argument("--auto-calibrate", action=argparse.BooleanOptionalAction, default=True, help="Auto-kalibrasi owner di tengah layar (default True)")
     parser.add_argument("--threads", type=int, default=2, help="Thread CPU ONNX; default 2 untuk baseline Mac")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -34,8 +42,8 @@ def arguments() -> argparse.Namespace:
     args = parser.parse_args()
     if not 0 < args.confidence <= 1 or not 0 < args.iou <= 1:
         parser.error("confidence dan iou harus >0 dan <=1")
-    if min(args.threads, args.width, args.height) <= 0 or (args.max_frames is not None and args.max_frames <= 0):
-        parser.error("threads, width, height, max-frames harus positif")
+    if min(args.threads, args.width, args.height, args.max_yaw, args.max_pitch, args.max_roll, args.fov, args.friend_margin_cm) <= 0 or (args.max_frames is not None and args.max_frames <= 0):
+        parser.error("threads, width, height, max-yaw, max-pitch, max-roll, fov, friend-margin-cm, max-frames harus positif")
     if args.camera < 0:
         parser.error("camera harus >=0")
     return args
@@ -50,17 +58,32 @@ def write_record(stream, record: dict) -> None:
 
 def run(args: argparse.Namespace) -> None:
     """Input konfigurasi CLI; kelola sesi, render preview, playback, dan cleanup deterministik."""
+    pose_model = getattr(args, "pose_model", DEFAULT_POSE_MODEL)
+    max_yaw = getattr(args, "max_yaw", 35.0)
+    max_pitch = getattr(args, "max_pitch", 25.0)
+    max_roll = getattr(args, "max_roll", 35.0)
+    fov_deg = getattr(args, "fov", 60.0)
+    friend_margin_cm = getattr(args, "friend_margin_cm", 25.0)
+    auto_calibrate = getattr(args, "auto_calibrate", True)
     detector = FaceDetector(args.model, args.confidence, args.iou, args.threads)
+    pose_estimator = HeadPoseEstimator(pose_model)
     source = None
     metrics = None
     window = "No-Peek experiment"
-    analyzer = Analyzer()
+    analyzer = Analyzer(
+        max_yaw=max_yaw,
+        max_pitch=max_pitch,
+        max_roll=max_roll,
+        auto_calibrate=auto_calibrate,
+        fov_deg=fov_deg,
+        friend_margin_cm=friend_margin_cm,
+    )
     history: deque[float] = deque(maxlen=300)
     paused, eof, mirror = False, False, args.mirror if args.mirror is not None else args.video is None
     speed, processed, segment = 1.0, 0, 0
     requested_seek = None
     updating_slider = True
-    message = "Tekan C saat hanya owner terlihat. Sudut yaw/pitch belum tersedia."
+    message = "Auto-kalibrasi aktif (duduk di tengah). Tekan C untuk manual, A toggle auto."
 
     def on_position(value: int) -> None:
         """Input posisi slider 0..1000; simpan permintaan seek dari pengguna untuk loop utama."""
@@ -84,9 +107,11 @@ def run(args: argparse.Namespace) -> None:
             args.metrics.parent.mkdir(parents=True, exist_ok=True)
             metrics = args.metrics.open("x", encoding="utf-8")
         source = FrameSource(args.video, args.camera, args.width, args.height)
-        write_record(metrics, {"type": "session", "model": str(args.model), "source": source.label,
-                              "confidence": args.confidence, "iou": args.iou, "threads": args.threads,
-                              "provider": "CPUExecutionProvider", "orientation": "five_point_proxy",
+        write_record(metrics, {"type": "session", "model": str(args.model), "pose_model": str(pose_model),
+                              "source": source.label, "confidence": args.confidence, "iou": args.iou,
+                              "threads": args.threads, "provider": "CPUExecutionProvider",
+                              "orientation": "mediapipe_head_pose", "max_yaw": max_yaw,
+                              "max_pitch": max_pitch, "max_roll": max_roll,
                               "source_fps": source.fps, "clock": "media" if source.is_video else "monotonic"})
         if not args.headless:
             # HighGUI dan input keyboard tetap di main thread untuk backend Cocoa macOS.
@@ -95,7 +120,7 @@ def run(args: argparse.Namespace) -> None:
             if source.is_video and source.frame_count > 1:
                 cv2.createTrackbar("Position", window, 0, 1000, on_position)
             updating_slider = False
-        print(f"Source={source.label}; CPU threads={args.threads}; model input={detector.size}")
+        print(f"Source={source.label}; CPU threads={args.threads}; model input={detector.size}; pose=MediaPipe")
         frame, observations, info = None, [], {}
         needs_frame = True
         while True:
@@ -117,6 +142,7 @@ def run(args: argparse.Namespace) -> None:
                 else:
                     frame = next_frame
                     faces, timings = detector.detect(frame)
+                    timings["pose_ms"] = pose_estimator.estimate(frame, faces)
                     observations = analyzer.update(faces, source.timestamp, frame.shape)
                     history.append(timings["inference_ms"])
                     processed += 1
@@ -126,11 +152,16 @@ def run(args: argparse.Namespace) -> None:
                             "p50_ms": float(np.percentile(history, 50)),
                             "p95_ms": float(np.percentile(history, 95)),
                             "confidence": detector.confidence, "iou": detector.iou,
+                            "max_yaw": max_yaw, "max_pitch": max_pitch, "max_roll": max_roll,
                             "input_size": detector.size, "threads": args.threads,
-                            "owner": analyzer.owner, "calibrated": analyzer.calibrated, **timings}
+                            "owner": analyzer.owner, "calibrated": analyzer.calibrated,
+                            "calibration_mode": analyzer.calibration_mode,
+                            "auto_calibrate": analyzer.auto_calibrate, **timings}
                     write_record(metrics, {"type": "frame", "segment": segment, **info,
                                           "faces": observations, "events": analyzer.events})
                     for event in analyzer.events:
+                        if event.get("event") == "AUTO_CALIBRATED":
+                            message = f"Owner = ID {event['id']} (AUTO-CALIBRATED)."
                         print(json.dumps(event))
                     if source.is_video and not args.headless and source.frame_count > 1:
                         updating_slider = True
@@ -144,6 +175,12 @@ def run(args: argparse.Namespace) -> None:
                 continue
             info.update(paused=paused, speed=speed, owner=analyzer.owner, message=message)
             cv2.imshow(window, render(frame, observations, info, mirror))
+            if processed == 1:
+                try:
+                    cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 1)
+                    cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 0)
+                except cv2.error:
+                    pass
             # Semua frame video diproses; jika inference lambat, playback melambat tanpa frame drop.
             wait_ms = max(1, round(1000/source.fps/speed - (time.perf_counter()-loop_started)*1000)) if source.is_video and not paused else 15 if paused else 1
             key = cv2.waitKey(wait_ms) & 0xFF
@@ -177,11 +214,13 @@ def run(args: argparse.Namespace) -> None:
                 speed = min(4.0, max(0.25, speed * (0.5 if key == ord("-") else 2)))
             elif key == ord("m"):
                 mirror = not mirror
-            elif key in (ord("c"), ord("r")):
+            elif key in (ord("a"), ord("c"), ord("r")):
                 if key == ord("r"):
                     analyzer.reset()
-                    message = "Tracking/timer direset. Tekan C untuk kalibrasi."
+                    message = "Tracking/timer direset. Duduk di tengah (auto) atau tekan C."
                     observations = analyzer.update(faces, source.timestamp, frame.shape)
+                elif key == ord("a"):
+                    message = analyzer.toggle_auto_calibrate()
                 else:
                     message = analyzer.calibrate([item["id"] for item in observations])
                     observations = analyzer.update(faces, source.timestamp, frame.shape)
@@ -194,6 +233,7 @@ def run(args: argparse.Namespace) -> None:
         write_record(metrics, summary)
         print(json.dumps(summary))
     finally:
+        pose_estimator.close()
         if source is not None:
             source.close()
         if metrics is not None:
