@@ -10,7 +10,14 @@ import numpy as np
 
 from no_peek.detector import Face
 
-DEFAULT_POSE_MODEL = Path(__file__).resolve().parents[2] / "model/face_landmarker.task"
+def _resolve_default_pose_model() -> Path:
+    root_candidate = Path(__file__).resolve().parents[3] / "model/face_landmarker.task"
+    if root_candidate.is_file():
+        return root_candidate
+    return Path(__file__).resolve().parents[2] / "model/face_landmarker.task"
+
+
+DEFAULT_POSE_MODEL = _resolve_default_pose_model()
 
 
 def matrix_to_angles(matrix: np.ndarray) -> dict[str, float] | None:

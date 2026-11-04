@@ -5,3 +5,11 @@ __pycache__/
 dist/
 build/
 experiments/
+gui/target/
+target/
+
+# Environment files
+.env
+.env.*
+!.env.example
+

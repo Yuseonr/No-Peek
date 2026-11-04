@@ -34,23 +34,36 @@ Didukung pada **Windows** dan **macOS** — 100% pemrosesan lokal tanpa pengirim
 
 ```text
 No-Peek/
+├── .env                         # Konfigurasi mode (dev/prod), IPC, kamera, & geometri UI
+├── .env.example                 # Template konfigurasi environment
+├── plan.md                      # Dokumen arsitektur Dynamic Island GUI (Rust) + IPC (Python)
 ├── docs/
-│   ├── No-Peek.md               # Dokumentasi pendekatan teknis & arsitektur
+│   ├── No-Peek.md               # Dokumentasi pendekatan teknis & arsitektur CV
 │   └── No-Peek.pdf
 ├── model/
 │   ├── yolov8n-face.onnx        # Model deteksi wajah (Tahap 1)
 │   └── face_landmarker.task     # Model MediaPipe 3D Head Pose (Tahap 2)
-├── src/no_peek/
-│   ├── source.py                # Akuisisi frame webcam/video & manajemen clock
-│   ├── detector.py              # Inferensi YOLOv8n-Face ONNX & C++ NMS
-│   ├── pose.py                  # Estimasi sudut 3D (yaw/pitch/roll) via MediaPipe
-│   ├── geometry.py              # Kalkulasi jarak (cm), zona tengah, & logika FRIEND
-│   ├── analysis.py              # Pelacakan IoU, auto-kalibrasi, & state machine risiko
-│   ├── preview.py               # Rendering UI preview & panel telemetri OpenCV
-│   └── main.py                  # CLI entry point & orkestrasi sesi
-└── tests/
-    ├── test_experiment.py       # Unit test decoder, geometri, head pose, & temporal
-    └── test_player.py           # Integrasi kontrol pemutar video & ekspor metrik
+├── gui/                         # [RUST] Native Dynamic Island GUI (Windows & macOS)
+│   ├── Cargo.toml
+│   └── crates/
+│       ├── nopeek-core/         # Geometri, pegas animasi, parser SVG, .env config, & kontrak IPC
+│       └── nopeek-gui/          # Windowing & renderer native (Win32/Direct2D & AppKit/CoreGraphics)
+└── inference/                   # [PYTHON] Computer Vision & Temporal Risk Engine
+    ├── pyproject.toml
+    ├── src/no_peek/
+    │   ├── config.py            # Pemuat konfigurasi .env lintas komponen
+    │   ├── ipc.py               # Kanal komunikasi IPC JSON Lines dua arah (stdout/stdin)
+    │   ├── source.py            # Akuisisi frame webcam/video & manajemen clock
+    │   ├── detector.py          # Inferensi YOLOv8n-Face ONNX & C++ NMS
+    │   ├── pose.py              # Estimasi sudut 3D (yaw/pitch/roll) via MediaPipe
+    │   ├── geometry.py          # Kalkulasi jarak (cm), zona tengah, & logika FRIEND
+    │   ├── analysis.py          # Pelacakan IoU, auto-kalibrasi, & state machine risiko
+    │   ├── preview.py           # Rendering UI preview & panel telemetri OpenCV (mode dev)
+    │   └── main.py              # CLI entry point & orkestrasi sesi
+    └── tests/
+        ├── test_experiment.py   # Unit test decoder, geometri, head pose, & temporal
+        ├── test_player.py       # Integrasi kontrol pemutar video & ekspor metrik
+        └── test_ipc_config.py   # Unit test konfigurasi .env & protokol IPC JSON Lines
 ```
 
 ---
@@ -130,5 +143,9 @@ uv run no-peek --video sample.mp4 --metrics experiments/run1.jsonl
 ## Menjalankan Unit Test
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+# 1. Unit Test Python Inference:
+.\.venv\Scripts\python.exe -m unittest discover -s inference/tests -v
+
+# 2. Unit Test Rust GUI Core:
+cargo test --manifest-path gui/Cargo.toml -p nopeek-core
 ```

@@ -16,13 +16,20 @@ from no_peek.preview import render
 from no_peek.source import FrameSource
 
 
+def _default_yolo_model() -> Path:
+    root_candidate = Path(__file__).resolve().parents[3] / "model/yolov8n-face.onnx"
+    if root_candidate.is_file():
+        return root_candidate
+    return Path(__file__).resolve().parents[2] / "model/yolov8n-face.onnx"
+
+
 def arguments() -> argparse.Namespace:
     """Input argumen terminal; output konfigurasi tervalidasi untuk satu sesi eksperimen."""
     parser = argparse.ArgumentParser(description="No-Peek: eksperimen webcam/video YOLOv8-Face + MediaPipe Head Pose lokal")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--video", type=Path, help="File video lokal; tanpa opsi ini gunakan webcam")
     source.add_argument("--camera", type=int, default=0, help="Index webcam (default 0)")
-    parser.add_argument("--model", type=Path, default=Path(__file__).resolve().parents[2]/"model/yolov8n-face.onnx")
+    parser.add_argument("--model", type=Path, default=_default_yolo_model())
     parser.add_argument("--pose-model", type=Path, default=DEFAULT_POSE_MODEL, help="Model MediaPipe Face Landmarker (.task)")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--iou", type=float, default=0.45)
