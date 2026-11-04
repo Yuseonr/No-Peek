@@ -77,7 +77,7 @@ pub enum IpcEvent {
 }
 
 /// Outgoing JSON line command from Rust GUI (System Tray / Menu Bar) to Python (`stdin`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum IpcCommand {
     Calibrate,
@@ -111,7 +111,13 @@ mod tests {
         let json_line = r#"{"type":"state_update","ts":1700000000.5,"level":"ALERT","alert_active":true,"icon":"eye_warning","message":"Pengintip Terdeteksi (Kiri)","observer_count":1,"max_risk_s":2.4,"observers":[{"id":2,"state":"ALERT","position":"LEFT","distance_cm":95.0,"risk_s":2.4}],"calibrated":true,"calibration_mode":"AUTO","auto_calibrate":true,"owner_id":1,"paused":false,"fps":29.8}"#;
         let ev = IpcEvent::parse_line(json_line).expect("should parse state_update");
         match ev {
-            IpcEvent::StateUpdate { level, alert_active, message, observer_count, .. } => {
+            IpcEvent::StateUpdate {
+                level,
+                alert_active,
+                message,
+                observer_count,
+                ..
+            } => {
                 assert_eq!(level, RiskLevel::Alert);
                 assert!(alert_active);
                 assert_eq!(message, "Pengintip Terdeteksi (Kiri)");

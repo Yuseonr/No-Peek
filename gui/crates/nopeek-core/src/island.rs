@@ -121,7 +121,11 @@ impl Island {
     pub fn set_target(&mut self, g: Geom, now: f64, trigger_pop: bool) {
         self.target = g;
         let growing = g.w * g.h >= self.w.value * self.h.value;
-        let (tw, th) = if growing { (GROW_W, GROW_H) } else { (SHRINK_W, SHRINK_H) };
+        let (tw, th) = if growing {
+            (GROW_W, GROW_H)
+        } else {
+            (SHRINK_W, SHRINK_H)
+        };
         self.w.retune(tw.0, tw.1);
         self.h.retune(th.0, th.1);
         self.r.retune(RADIUS.0, RADIUS.1);

@@ -4,13 +4,16 @@ import argparse
 from collections import deque
 import json
 from pathlib import Path
+import sys
 import time
 
 import cv2
 import numpy as np
 
 from no_peek.analysis import Analyzer
+from no_peek.config import AppConfig
 from no_peek.detector import FaceDetector
+from no_peek.ipc import IpcChannel, build_state_payload
 from no_peek.pose import DEFAULT_POSE_MODEL, HeadPoseEstimator
 from no_peek.preview import render
 from no_peek.source import FrameSource
@@ -25,28 +28,35 @@ def _default_yolo_model() -> Path:
 
 def arguments() -> argparse.Namespace:
     """Input argumen terminal; output konfigurasi tervalidasi untuk satu sesi eksperimen."""
+    cfg = AppConfig.from_env()
     parser = argparse.ArgumentParser(description="No-Peek: eksperimen webcam/video YOLOv8-Face + MediaPipe Head Pose lokal")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--video", type=Path, help="File video lokal; tanpa opsi ini gunakan webcam")
-    source.add_argument("--camera", type=int, default=0, help="Index webcam (default 0)")
-    parser.add_argument("--model", type=Path, default=_default_yolo_model())
-    parser.add_argument("--pose-model", type=Path, default=DEFAULT_POSE_MODEL, help="Model MediaPipe Face Landmarker (.task)")
-    parser.add_argument("--confidence", type=float, default=0.5)
-    parser.add_argument("--iou", type=float, default=0.45)
-    parser.add_argument("--max-yaw", type=float, default=35.0, help="Ambang mutlak yaw derajat untuk menghadap layar (default 35)")
-    parser.add_argument("--max-pitch", type=float, default=25.0, help="Ambang mutlak pitch derajat untuk menghadap layar (default 25)")
-    parser.add_argument("--max-roll", type=float, default=35.0, help="Ambang mutlak roll derajat (default 35)")
-    parser.add_argument("--fov", type=float, default=60.0, help="FoV horizontal kamera derajat untuk estimasi jarak (default 60)")
-    parser.add_argument("--friend-margin-cm", type=float, default=25.0, help="Toleransi jarak belakang owner (cm) untuk role FRIEND (default 25)")
-    parser.add_argument("--auto-calibrate", action=argparse.BooleanOptionalAction, default=True, help="Auto-kalibrasi owner di tengah layar (default True)")
-    parser.add_argument("--threads", type=int, default=2, help="Thread CPU ONNX; default 2 untuk baseline Mac")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
+    source.add_argument("--camera", type=int, default=cfg.camera_index, help="Index webcam (default dari .env)")
+    parser.add_argument("--model", type=Path, default=cfg.yolo_model)
+    parser.add_argument("--pose-model", type=Path, default=cfg.pose_model, help="Model MediaPipe Face Landmarker (.task)")
+    parser.add_argument("--confidence", type=float, default=cfg.confidence)
+    parser.add_argument("--iou", type=float, default=cfg.iou)
+    parser.add_argument("--max-yaw", type=float, default=cfg.max_yaw, help="Ambang mutlak yaw derajat untuk menghadap layar (default 35)")
+    parser.add_argument("--max-pitch", type=float, default=cfg.max_pitch, help="Ambang mutlak pitch derajat untuk menghadap layar (default 25)")
+    parser.add_argument("--max-roll", type=float, default=cfg.max_roll, help="Ambang mutlak roll derajat (default 35)")
+    parser.add_argument("--fov", type=float, default=cfg.fov_deg, help="FoV horizontal kamera derajat untuk estimasi jarak (default 60)")
+    parser.add_argument("--friend-margin-cm", type=float, default=cfg.friend_margin_cm, help="Toleransi jarak belakang owner (cm) untuk role FRIEND (default 25)")
+    parser.add_argument("--auto-calibrate", action=argparse.BooleanOptionalAction, default=cfg.auto_calibrate, help="Auto-kalibrasi owner di tengah layar (default True)")
+    parser.add_argument("--threads", type=int, default=cfg.onnx_threads, help="Thread CPU ONNX; default 2 untuk baseline Mac")
+    parser.add_argument("--width", type=int, default=cfg.camera_width)
+    parser.add_argument("--height", type=int, default=cfg.camera_height)
     parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--ipc", choices=["none", "stdio", "tcp"], default=cfg.ipc_mode, help="Mode kanal IPC ke Rust GUI")
+    parser.add_argument("--ipc-heartbeat-s", type=float, default=cfg.ipc_heartbeat_s)
+    parser.add_argument("--text-alert", type=str, default=cfg.text_alert)
+    parser.add_argument("--text-escalated", type=str, default=cfg.text_escalated)
     parser.add_argument("--metrics", type=Path, help="JSONL per frame; opt-in, tidak menyimpan gambar")
-    parser.add_argument("--headless", action="store_true", help="Tanpa window, untuk evaluasi batch video")
+    parser.add_argument("--headless", action="store_true", default=None, help="Tanpa window, untuk evaluasi batch video atau prod")
     parser.add_argument("--max-frames", type=int, help="Batasi frame yang diproses untuk smoke test")
     args = parser.parse_args()
+    if args.headless is None:
+        args.headless = cfg.headless
     if not 0 < args.confidence <= 1 or not 0 < args.iou <= 1:
         parser.error("confidence dan iou harus >0 dan <=1")
     if min(args.threads, args.width, args.height, args.max_yaw, args.max_pitch, args.max_roll, args.fov, args.friend_margin_cm) <= 0 or (args.max_frames is not None and args.max_frames <= 0):
@@ -72,6 +82,21 @@ def run(args: argparse.Namespace) -> None:
     fov_deg = getattr(args, "fov", 60.0)
     friend_margin_cm = getattr(args, "friend_margin_cm", 25.0)
     auto_calibrate = getattr(args, "auto_calibrate", True)
+
+    ipc_mode = getattr(args, "ipc", "none")
+    use_ipc = ipc_mode in ("stdio", "tcp")
+    ipc_channel: IpcChannel | None = None
+    if use_ipc:
+        ipc_channel = IpcChannel()
+        ipc_channel.start_reader()
+
+    def log(msg: str) -> None:
+        if use_ipc and ipc_mode == "stdio":
+            sys.stderr.write(str(msg) + "\n")
+            sys.stderr.flush()
+        else:
+            print(msg)
+
     detector = FaceDetector(args.model, args.confidence, args.iou, args.threads)
     pose_estimator = HeadPoseEstimator(pose_model)
     source = None
@@ -120,6 +145,13 @@ def run(args: argparse.Namespace) -> None:
                               "orientation": "mediapipe_head_pose", "max_yaw": max_yaw,
                               "max_pitch": max_pitch, "max_roll": max_roll,
                               "source_fps": source.fps, "clock": "media" if source.is_video else "monotonic"})
+        if ipc_channel:
+            ipc_channel.send({
+                "type": "ready",
+                "version": "0.1.0",
+                "source": source.label,
+                "headless": bool(args.headless),
+            })
         if not args.headless:
             # HighGUI dan input keyboard tetap di main thread untuk backend Cocoa macOS.
             cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -127,9 +159,10 @@ def run(args: argparse.Namespace) -> None:
             if source.is_video and source.frame_count > 1:
                 cv2.createTrackbar("Position", window, 0, 1000, on_position)
             updating_slider = False
-        print(f"Source={source.label}; CPU threads={args.threads}; model input={detector.size}; pose=MediaPipe")
+        log(f"Source={source.label}; CPU threads={args.threads}; model input={detector.size}; pose=MediaPipe")
         frame, observations, info = None, [], {}
         needs_frame = True
+        processing_ms = 0.0
         while True:
             loop_started = time.perf_counter()
             if requested_seek is not None:
@@ -169,11 +202,77 @@ def run(args: argparse.Namespace) -> None:
                     for event in analyzer.events:
                         if event.get("event") == "AUTO_CALIBRATED":
                             message = f"Owner = ID {event['id']} (AUTO-CALIBRATED)."
-                        print(json.dumps(event))
+                            if ipc_channel:
+                                ipc_channel.send({
+                                    "type": "calibration",
+                                    "calibrated": True,
+                                    "owner_id": event["id"],
+                                    "mode": "AUTO",
+                                    "message": message,
+                                })
+                        log(json.dumps(event))
                     if source.is_video and not args.headless and source.frame_count > 1:
                         updating_slider = True
                         cv2.setTrackbarPos("Position", window, round(source.index / (source.frame_count-1)*1000))
                         updating_slider = False
+
+            if ipc_channel:
+                while (cmd := ipc_channel.poll_command()) is not None:
+                    action = cmd.get("cmd")
+                    if action == "calibrate":
+                        message = analyzer.calibrate([item["id"] for item in observations])
+                        if frame is not None:
+                            observations = analyzer.update(faces, source.timestamp, frame.shape)
+                        ipc_channel.send({
+                            "type": "calibration",
+                            "calibrated": analyzer.calibrated,
+                            "owner_id": analyzer.owner,
+                            "mode": analyzer.calibration_mode,
+                            "message": message,
+                        })
+                        log(message)
+                    elif action == "toggle_auto_calibrate":
+                        message = analyzer.toggle_auto_calibrate()
+                        ipc_channel.send({
+                            "type": "calibration",
+                            "calibrated": analyzer.calibrated,
+                            "owner_id": analyzer.owner,
+                            "mode": analyzer.calibration_mode,
+                            "message": message,
+                        })
+                        log(message)
+                    elif action == "reset":
+                        analyzer.reset()
+                        message = "Tracking/timer direset. Duduk di tengah (auto) atau tekan C."
+                        if frame is not None:
+                            observations = analyzer.update(faces, source.timestamp, frame.shape)
+                        log(message)
+                    elif action == "pause":
+                        paused = True
+                        if not source.is_video:
+                            analyzer.reset()
+                            message = "Pause/resume webcam: kalibrasi ulang agar timer tidak menghitung waktu pause."
+                    elif action == "resume":
+                        paused = False
+                        needs_frame = True
+                    elif action == "quit":
+                        return
+
+                fps_val = source.fps if source.is_video else (1000.0 / max(processing_ms, 0.001))
+                payload = build_state_payload(
+                    observations=observations,
+                    calibrated=analyzer.calibrated,
+                    calibration_mode=analyzer.calibration_mode,
+                    auto_calibrate=analyzer.auto_calibrate,
+                    owner_id=analyzer.owner,
+                    paused=paused,
+                    fps=fps_val,
+                    mirror=mirror,
+                    base_alert_text=getattr(args, "text_alert", "Pengintip Terdeteksi"),
+                    base_escalated_text=getattr(args, "text_escalated", "Bahaya! Layar Sedang Diintip"),
+                )
+                ipc_channel.emit_state_if_needed(payload, heartbeat_s=getattr(args, "ipc_heartbeat_s", 2.0))
+
             if frame is None:
                 break
             if args.headless:
@@ -231,15 +330,24 @@ def run(args: argparse.Namespace) -> None:
                 else:
                     message = analyzer.calibrate([item["id"] for item in observations])
                     observations = analyzer.update(faces, source.timestamp, frame.shape)
-                print(message)
+                log(message)
                 write_record(metrics, {"type": "control", "action": chr(key), "segment": segment,
                                        "frame": source.index, "message": message, "faces": observations})
         summary = {"type": "summary", "processed_frames": processed,
                    "inference_p50_ms": float(np.percentile(history, 50)) if history else None,
                    "inference_p95_ms": float(np.percentile(history, 95)) if history else None}
         write_record(metrics, summary)
-        print(json.dumps(summary))
+        log(json.dumps(summary))
+    except Exception as error:
+        if ipc_channel:
+            try:
+                ipc_channel.send({"type": "error", "fatal": True, "message": str(error)})
+            except (OSError, ValueError):
+                pass
+        raise
     finally:
+        if ipc_channel:
+            ipc_channel.close()
         pose_estimator.close()
         if source is not None:
             source.close()
@@ -252,11 +360,18 @@ def run(args: argparse.Namespace) -> None:
 def main() -> None:
     """Tanpa input Python; parse CLI dan jalankan eksperimen, tampilkan error tanpa stacktrace panjang."""
     args = arguments()
+    is_stdio = getattr(args, "ipc", "none") == "stdio"
     try:
         run(args)
     except KeyboardInterrupt:
-        print("Eksperimen dihentikan.")
+        if is_stdio:
+            sys.stderr.write("Eksperimen dihentikan.\n")
+        else:
+            print("Eksperimen dihentikan.")
     except (OSError, RuntimeError, ValueError, cv2.error) as error:
+        if is_stdio:
+            sys.stderr.write(f"No-Peek: {error}\n")
+            sys.exit(1)
         raise SystemExit(f"No-Peek: {error}") from error
 
 

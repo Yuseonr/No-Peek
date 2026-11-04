@@ -78,11 +78,11 @@ impl GuiConfig {
 
     pub fn from_map(map: &HashMap<String, String>) -> Self {
         let mut cfg = Self::default();
-        let get = |k: &str| -> Option<String> {
-            std::env::var(k).ok().or_else(|| map.get(k).cloned())
-        };
+        let get =
+            |k: &str| -> Option<String> { std::env::var(k).ok().or_else(|| map.get(k).cloned()) };
         if let Some(m) = get("NOPEEK_ENV") {
-            cfg.env_mode = if m.eq_ignore_ascii_case("prod") || m.eq_ignore_ascii_case("production") {
+            cfg.env_mode = if m.eq_ignore_ascii_case("prod") || m.eq_ignore_ascii_case("production")
+            {
                 EnvMode::Prod
             } else {
                 EnvMode::Dev

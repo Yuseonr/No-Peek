@@ -107,7 +107,10 @@ impl Color {
         Self { a, ..self }
     }
     pub fn mul_alpha(self, f: f32) -> Self {
-        Self { a: self.a * f, ..self }
+        Self {
+            a: self.a * f,
+            ..self
+        }
     }
 }
 

@@ -93,6 +93,16 @@ class ConfigAndIpcTests(unittest.TestCase):
         lines = out_buf.getvalue().strip().splitlines()
         self.assertEqual(len(lines), 1)
 
+    def test_main_arguments_and_env_defaults(self):
+        from unittest.mock import patch
+        from no_peek.main import arguments
+        test_args = ["no-peek", "--ipc", "stdio", "--headless"]
+        with patch("sys.argv", test_args):
+            parsed = arguments()
+            self.assertEqual(parsed.ipc, "stdio")
+            self.assertTrue(parsed.headless)
+            self.assertGreater(parsed.confidence, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

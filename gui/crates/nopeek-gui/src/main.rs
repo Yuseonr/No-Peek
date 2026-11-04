@@ -1,19 +1,50 @@
-//! No-Peek Dynamic Island GUI Entry Point.
-//! See `plan.md` at the repository root for the full Win32/Direct2D (Windows)
-//! and AppKit/CoreGraphics (macOS) implementation blueprint derived from `../oyenza-studio`.
+#![windows_subsystem = "windows"]
 
-use nopeek_core::config::GuiConfig;
-use nopeek_core::island::Island;
+//! No-Peek Dynamic Island GUI Entry Point for Windows.
+//! See `plan.md` for architectural specifications.
+
+mod app;
+mod clock;
+mod events;
+mod gfx;
+mod services;
+mod tray;
+mod window;
+
+use nopeek_core::config::{EnvMode, GuiConfig};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 
 fn main() {
-    let (cfg, path) = GuiConfig::find_and_load();
-    let island = Island::new(&cfg);
+    let (cfg, env_path) = GuiConfig::find_and_load();
+
+    #[cfg(windows)]
+    if cfg.env_mode == EnvMode::Dev {
+        use windows::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS).or_else(|_| AllocConsole());
+        }
+    }
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+
     println!(
-        "No-Peek GUI Scaffolding Ready | mode={:?} | ipc={:?} | idle={}x{} DIP | dotenv={:?}",
-        cfg.env_mode,
-        cfg.ipc_mode,
-        island.current().w,
-        island.current().h,
-        path
+        "[nopeek-gui] Starting Dynamic Island | env={:?} | ipc={:?} | .env={:?}",
+        cfg.env_mode, cfg.ipc_mode, env_path
     );
+
+    let exit_code = match app::run(cfg) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("[nopeek-gui] Fatal error: {err}");
+            1
+        }
+    };
+
+    unsafe {
+        CoUninitialize();
+    }
+
+    std::process::exit(exit_code);
 }
