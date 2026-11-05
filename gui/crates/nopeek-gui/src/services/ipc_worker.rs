@@ -11,6 +11,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
@@ -98,6 +100,11 @@ impl IpcWorker {
             if cfg.env_mode == EnvMode::Prod {
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
+        }
+
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
         }
 
         eprintln!(
