@@ -11,11 +11,13 @@ import cv2
 import numpy as np
 
 from no_peek.analysis import Analyzer
-from no_peek.config import AppConfig
+from no_peek.config import AppConfig, save_preferences
 from no_peek.detector import FaceDetector
 from no_peek.ipc import IpcChannel, build_state_payload
 from no_peek.pose import DEFAULT_POSE_MODEL, HeadPoseEstimator
-from no_peek.preview import render
+from no_peek.preview import render, render_compact
+from no_peek.settings import Settings
+from no_peek.native_preview import NativePreview
 from no_peek.source import FrameSource
 
 
@@ -46,7 +48,11 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=cfg.onnx_threads, help="Thread CPU ONNX; default 2 untuk baseline Mac")
     parser.add_argument("--width", type=int, default=cfg.camera_width)
     parser.add_argument("--height", type=int, default=cfg.camera_height)
-    parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=cfg.mirror if cfg.mirror is not None else None)
+    parser.add_argument("--compact-preview", action="store_true", help="Preview kamera minimal untuk menu desktop")
+    parser.add_argument("--desktop", action="store_true", help="Worker tray tanpa window kamera")
+    parser.add_argument("--alert-after-s", type=float, default=cfg.alert_after_s)
+    parser.add_argument("--escalated-after-s", type=float, default=cfg.escalated_after_s)
     parser.add_argument("--ipc", choices=["none", "stdio", "tcp"], default=cfg.ipc_mode, help="Mode kanal IPC ke Rust GUI")
     parser.add_argument("--ipc-heartbeat-s", type=float, default=cfg.ipc_heartbeat_s)
     parser.add_argument("--text-alert", type=str, default=cfg.text_alert)
@@ -56,7 +62,13 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, help="Batasi frame yang diproses untuk smoke test")
     args = parser.parse_args()
     if args.headless is None:
-        args.headless = cfg.headless
+        args.headless = not cfg.preview if cfg.preview is not None else cfg.headless
+    if args.desktop:
+        args.headless = True
+    try:
+        Settings(args.confidence, args.alert_after_s, args.escalated_after_s, not args.headless, bool(args.mirror))
+    except ValueError as error:
+        parser.error(str(error))
     if not 0 < args.confidence <= 1 or not 0 < args.iou <= 1:
         parser.error("confidence dan iou harus >0 dan <=1")
     if min(args.threads, args.width, args.height, args.max_yaw, args.max_pitch, args.max_roll, args.fov, args.friend_margin_cm) <= 0 or (args.max_frames is not None and args.max_frames <= 0):
@@ -75,6 +87,9 @@ def write_record(stream, record: dict) -> None:
 
 def run(args: argparse.Namespace) -> None:
     """Input konfigurasi CLI; kelola sesi, render preview, playback, dan cleanup deterministik."""
+    desktop = getattr(args, "desktop", False)
+    if desktop:
+        args.headless = True
     pose_model = getattr(args, "pose_model", DEFAULT_POSE_MODEL)
     max_yaw = getattr(args, "max_yaw", 35.0)
     max_pitch = getattr(args, "max_pitch", 25.0)
@@ -109,6 +124,8 @@ def run(args: argparse.Namespace) -> None:
         auto_calibrate=auto_calibrate,
         fov_deg=fov_deg,
         friend_margin_cm=friend_margin_cm,
+        alert_after_s=getattr(args, "alert_after_s", 2.0),
+        escalated_after_s=getattr(args, "escalated_after_s", 7.0),
     )
     history: deque[float] = deque(maxlen=300)
     paused, eof, mirror = False, False, args.mirror if args.mirror is not None else args.video is None
@@ -116,6 +133,51 @@ def run(args: argparse.Namespace) -> None:
     requested_seek = None
     updating_slider = True
     message = "Auto-kalibrasi aktif (duduk di tengah). Tekan C untuk manual, A toggle auto."
+    compact = getattr(args, "compact_preview", False)
+    settings = Settings(detector.confidence, analyzer.alert_after_s, analyzer.escalated_after_s, not args.headless, mirror)
+    window_created = False
+    native_preview = NativePreview()
+
+    def window_is_visible() -> bool:
+        try:
+            return cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) >= 1
+        except cv2.error as error:
+            if error.code == -27:
+                return False
+            raise
+
+    def set_preview(visible: bool) -> None:
+        nonlocal updating_slider, window_created
+        if visible:
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window, 640 if compact else 1400, 424 if compact else 850)
+            window_created = True
+            if source.is_video and source.frame_count > 1:
+                cv2.createTrackbar("Position", window, 0, 1000, on_position)
+            updating_slider = False
+        elif not args.headless and window_is_visible():
+            cv2.destroyWindow(window)
+        args.headless = not visible
+
+    def apply_settings(candidate: Settings, persist: bool = True) -> None:
+        nonlocal settings, mirror
+        if persist:
+            values = candidate.environment()
+            if desktop:
+                values.pop("NOPEEK_PREVIEW")
+            save_preferences(values)
+        if not desktop and candidate.preview != settings.preview:
+            set_preview(candidate.preview)
+        if candidate.confidence != settings.confidence or candidate.alert_after_s != settings.alert_after_s:
+            analyzer.reset()
+            observations.clear()
+        detector.confidence = candidate.confidence
+        analyzer.alert_after_s = candidate.alert_after_s
+        analyzer.escalated_after_s = candidate.escalated_after_s
+        settings = candidate
+        mirror = candidate.mirror
+        if ipc_channel:
+            ipc_channel.send(settings.payload())
 
     def on_position(value: int) -> None:
         """Input posisi slider 0..1000; simpan permintaan seek dari pengguna untuk loop utama."""
@@ -154,11 +216,9 @@ def run(args: argparse.Namespace) -> None:
             })
         if not args.headless:
             # HighGUI dan input keyboard tetap di main thread untuk backend Cocoa macOS.
-            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window, 1400, 850)
-            if source.is_video and source.frame_count > 1:
-                cv2.createTrackbar("Position", window, 0, 1000, on_position)
-            updating_slider = False
+            set_preview(True)
+        if ipc_channel:
+            ipc_channel.send(settings.payload())
         log(f"Source={source.label}; CPU threads={args.threads}; model input={detector.size}; pose=MediaPipe")
         frame, observations, info = None, [], {}
         needs_frame = True
@@ -232,6 +292,11 @@ def run(args: argparse.Namespace) -> None:
                         })
                         log(message)
                     elif action == "toggle_auto_calibrate":
+                        try:
+                            save_preferences({"NOPEEK_AUTO_CALIBRATE": str(not analyzer.auto_calibrate).lower()})
+                        except OSError as error:
+                            ipc_channel.send({"type": "error", "fatal": False, "message": f"Gagal menyimpan pengaturan: {error}"})
+                            continue
                         message = analyzer.toggle_auto_calibrate()
                         ipc_channel.send({
                             "type": "calibration",
@@ -249,14 +314,27 @@ def run(args: argparse.Namespace) -> None:
                         log(message)
                     elif action == "pause":
                         paused = True
+                        needs_frame = False
+                        if desktop and settings.preview:
+                            apply_settings(settings.changed({"cmd": "set_preview", "enabled": False}), persist=False)
                         if not source.is_video:
                             analyzer.reset()
+                            observations.clear()
                             message = "Pause/resume webcam: kalibrasi ulang agar timer tidak menghitung waktu pause."
                     elif action == "resume":
                         paused = False
                         needs_frame = True
                     elif action == "quit":
                         return
+                    elif action in ("set_preview", "toggle_preview", "toggle_mirror", "set_confidence", "set_alert_delay"):
+                        try:
+                            if desktop and action == "toggle_preview":
+                                raise ValueError("Preview kamera dinonaktifkan pada aplikasi desktop")
+                            if desktop and action == "set_preview" and cmd.get("enabled") and paused:
+                                raise ValueError("Lanjutkan deteksi sebelum membuka preview")
+                            apply_settings(settings.changed(cmd), persist=action != "set_preview")
+                        except (OSError, ValueError) as error:
+                            ipc_channel.send({"type": "error", "fatal": False, "message": f"Pengaturan tidak diterapkan: {error}"})
 
                 fps_val = source.fps if source.is_video else (1000.0 / max(processing_ms, 0.001))
                 payload = build_state_payload(
@@ -272,15 +350,25 @@ def run(args: argparse.Namespace) -> None:
                     base_escalated_text=getattr(args, "text_escalated", "Bahaya! Layar Sedang Diintip"),
                 )
                 ipc_channel.emit_state_if_needed(payload, heartbeat_s=getattr(args, "ipc_heartbeat_s", 2.0))
+                if desktop and settings.preview and not paused and frame is not None:
+                    preview_payload = native_preview.frame(frame, mirror, time.monotonic())
+                    if preview_payload is not None:
+                        ipc_channel.send(preview_payload)
 
             if frame is None:
                 break
             if args.headless:
                 if args.max_frames and processed >= args.max_frames:
                     break
+                needs_frame = not paused
+                if paused:
+                    if ipc_channel:
+                        ipc_channel.wait_for_command(timeout=min(2.0, max(0.1, getattr(args, "ipc_heartbeat_s", 2.0))))
+                    else:
+                        time.sleep(0.05)
                 continue
             info.update(paused=paused, speed=speed, owner=analyzer.owner, message=message)
-            cv2.imshow(window, render(frame, observations, info, mirror))
+            cv2.imshow(window, (render_compact if compact else render)(frame, observations, info, mirror))
             if processed == 1:
                 try:
                     cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 1)
@@ -290,7 +378,11 @@ def run(args: argparse.Namespace) -> None:
             # Semua frame video diproses; jika inference lambat, playback melambat tanpa frame drop.
             wait_ms = max(1, round(1000/source.fps/speed - (time.perf_counter()-loop_started)*1000)) if source.is_video and not paused else 15 if paused else 1
             key = cv2.waitKey(wait_ms) & 0xFF
-            if key in (27, ord("q")) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+            if key in (27, ord("q")) or not window_is_visible():
+                if compact and ipc_channel:
+                    apply_settings(settings.changed({"cmd": "toggle_preview"}))
+                    needs_frame = not paused
+                    continue
                 break
             if args.max_frames and processed >= args.max_frames:
                 break
@@ -319,7 +411,10 @@ def run(args: argparse.Namespace) -> None:
             elif key in (ord("+"), ord("="), ord("-")) and source.is_video:
                 speed = min(4.0, max(0.25, speed * (0.5 if key == ord("-") else 2)))
             elif key == ord("m"):
-                mirror = not mirror
+                if compact and ipc_channel:
+                    apply_settings(settings.changed({"cmd": "toggle_mirror"}))
+                else:
+                    mirror = not mirror
             elif key in (ord("a"), ord("c"), ord("r")):
                 if key == ord("r"):
                     analyzer.reset()
@@ -353,7 +448,7 @@ def run(args: argparse.Namespace) -> None:
             source.close()
         if metrics is not None:
             metrics.close()
-        if not args.headless:
+        if window_created:
             cv2.destroyAllWindows()
 
 

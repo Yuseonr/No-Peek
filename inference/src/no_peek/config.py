@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import tempfile
 
 
 def find_repo_root() -> Path:
@@ -40,6 +41,30 @@ def _env_bool(key: str, default: bool) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def save_preferences(values: dict[str, str], path: Path | None = None) -> None:
+    target = path or find_repo_root() / ".env"
+    lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+    pending = dict(values)
+    updated = []
+    for line in lines:
+        key = line.partition("=")[0].strip()
+        if key in values and not line.lstrip().startswith("#"):
+            if key in pending:
+                updated.append(f"{key}={pending.pop(key)}")
+        else:
+            updated.append(line)
+    updated.extend(f"{key}={value}" for key, value in pending.items())
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write("\n".join(updated) + "\n")
+        temporary.replace(target)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """Konfigurasi runtime Python inference yang disinkronkan dengan .env."""
@@ -64,6 +89,9 @@ class AppConfig:
     fov_deg: float = 60.0
     friend_margin_cm: float = 25.0
     auto_calibrate: bool = True
+    preview: bool | None = None
+    alert_after_s: float = 2.0
+    escalated_after_s: float = 7.0
     text_alert: str = "Pengintip Terdeteksi"
     text_escalated: str = "Bahaya! Layar Sedang Diintip"
 
@@ -107,6 +135,9 @@ class AppConfig:
             fov_deg=float(os.environ.get("NOPEEK_FOV_DEG", "60.0")),
             friend_margin_cm=float(os.environ.get("NOPEEK_FRIEND_MARGIN_CM", "25.0")),
             auto_calibrate=_env_bool("NOPEEK_AUTO_CALIBRATE", True),
+            preview=_env_bool("NOPEEK_PREVIEW", True) if "NOPEEK_PREVIEW" in os.environ else None,
+            alert_after_s=float(os.environ.get("NOPEEK_ALERT_AFTER_S", "2")),
+            escalated_after_s=float(os.environ.get("NOPEEK_ESCALATED_AFTER_S", "7")),
             text_alert=os.environ.get("NOPEEK_TEXT_ALERT", "Pengintip Terdeteksi"),
             text_escalated=os.environ.get("NOPEEK_TEXT_ESCALATED", "Bahaya! Layar Sedang Diintip"),
         )

@@ -43,6 +43,8 @@ class Analyzer:
         fov_deg: float = 60.0,
         friend_margin_cm: float = 25.0,
         max_friend_dist_cm: float = 115.0,
+        alert_after_s: float = 2.0,
+        escalated_after_s: float = 7.0,
     ):
         """Input parameter tracking, sudut, auto-kalibrasi, dan jarak; output state siap pakai."""
         self.grace = grace
@@ -54,6 +56,10 @@ class Analyzer:
         self.fov_deg = fov_deg
         self.friend_margin_cm = friend_margin_cm
         self.max_friend_dist_cm = max_friend_dist_cm
+        if not 0 < alert_after_s < escalated_after_s:
+            raise ValueError("Ambang waktu harus 0 < alert < escalated")
+        self.alert_after_s = alert_after_s
+        self.escalated_after_s = escalated_after_s
         self.reset()
 
     def reset(self) -> None:
@@ -177,7 +183,7 @@ class Analyzer:
                 if track.risk_since is None:
                     track.risk_since = now
                 elapsed = now - track.risk_since
-                track.state = "ESCALATED" if elapsed >= 7 else "ALERT" if elapsed >= 2 else "PENDING"
+                track.state = "ESCALATED" if elapsed >= self.escalated_after_s else "ALERT" if elapsed >= self.alert_after_s else "PENDING"
             else:
                 track.risk_since, track.state, elapsed = None, "MONITORING", 0.0
             if track.state != previous and track.state in ("ALERT", "ESCALATED"):

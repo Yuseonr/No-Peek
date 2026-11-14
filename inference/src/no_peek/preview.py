@@ -9,6 +9,32 @@ COLORS = {"MONITORING": (180, 180, 180), "OWNER": (100, 230, 90), "FRIEND": (240
 POINT_COLORS = [(255, 150, 70), (70, 170, 255), (100, 240, 240), (220, 100, 220), (220, 220, 100)]
 
 
+def render_compact(frame: np.ndarray, observations: list[dict], info: dict, mirror: bool) -> np.ndarray:
+    h, w = frame.shape[:2]
+    width = 640
+    height = max(1, round(h * width / w))
+    image = cv2.resize(frame, (width, height))
+    if mirror:
+        image = cv2.flip(image, 1)
+    for observation in observations:
+        box = np.asarray(observation["box"]).reshape(2, 2) * (width / w)
+        if mirror:
+            box[:, 0] = width - 1 - box[:, 0]
+        box = np.sort(box, axis=0).astype(int)
+        role = observation["role"]
+        color = COLORS.get(role, COLORS[observation["state"]])
+        cv2.rectangle(image, tuple(box[0]), tuple(box[1]), color, 1, cv2.LINE_AA)
+    canvas = np.full((height + 64, width, 3), (24, 24, 26), np.uint8)
+    canvas[:height] = image
+    status = "PAUSED" if info["paused"] else next(
+        (state for state in ("ESCALATED", "ALERT", "PENDING") if any(o["state"] == state for o in observations)),
+        "MONITORING" if info["owner"] is not None else "SEARCHING OWNER",
+    )
+    text(canvas, f"NO-PEEK   /   {status}", (18, height + 25), scale=0.5)
+    text(canvas, "Local camera  |  C calibrate  |  SPACE pause  |  ESC hide", (18, height + 48), scale=0.4)
+    return canvas
+
+
 def text(image: np.ndarray, message: str, xy: tuple[int, int], color=(220, 225, 235), scale=0.45) -> None:
     """Input canvas BGR, pesan ASCII, posisi; gambar tulisan ke canvas secara in-place."""
     cv2.putText(image, message, xy, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)

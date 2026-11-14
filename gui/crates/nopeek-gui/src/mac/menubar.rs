@@ -3,7 +3,6 @@
 
 use crate::mac::gfx::Bitmap;
 use nopeek_core::icons::{self, Icon};
-use nopeek_core::ipc::IpcCommand;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, sel, AllocAnyThread, MainThreadMarker, MainThreadOnly};
@@ -16,31 +15,8 @@ use objc2_core_graphics::CGContext;
 use objc2_foundation::{NSObject, NSObjectProtocol, NSSize, NSString};
 use std::cell::RefCell;
 
-#[derive(Clone, Debug, Default)]
-pub struct TrayState {
-    pub status_text: String,
-    pub mode_text: String,
-    pub auto_calibrate: bool,
-    pub paused: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MenuCmd {
-    Command(IpcCommand),
-    Quit,
-}
-
-pub enum MenuItem {
-    Item {
-        label: String,
-        cmd: MenuCmd,
-        checked: bool,
-    },
-    Info {
-        label: String,
-    },
-    Separator,
-}
+use nopeek_core::controls::{menu, MenuEntry};
+pub use nopeek_core::controls::{MenuAction as MenuCmd, TrayState};
 
 define_class!(
     /// Target handling Menu Bar item clicks.
@@ -85,14 +61,14 @@ impl MenuBar {
         }
         let target: Retained<MenuTarget> =
             unsafe { objc2::msg_send![MenuTarget::alloc(mtm), init] };
-        let items = build_menu_items(state);
+        let items = menu(state);
         let menu = build(mtm, &target, &items);
         item.setMenu(Some(&menu));
         Self { item, target, menu }
     }
 
     pub fn refresh(&mut self, mtm: MainThreadMarker, state: &TrayState) {
-        let items = build_menu_items(state);
+        let items = menu(state);
         self.menu = build(mtm, &self.target, &items);
         self.item.setMenu(Some(&self.menu));
     }
@@ -104,104 +80,72 @@ impl MenuBar {
     }
 }
 
-fn build_menu_items(state: &TrayState) -> Vec<MenuItem> {
-    let pause_resume_item = if state.paused {
-        MenuItem::Item {
-            label: "Resume Detection".into(),
-            cmd: MenuCmd::Command(IpcCommand::Resume),
-            checked: false,
-        }
-    } else {
-        MenuItem::Item {
-            label: "Pause Detection".into(),
-            cmd: MenuCmd::Command(IpcCommand::Pause),
-            checked: false,
-        }
-    };
-
-    vec![
-        MenuItem::Info {
-            label: state.status_text.clone(),
-        },
-        MenuItem::Info {
-            label: state.mode_text.clone(),
-        },
-        MenuItem::Separator,
-        // Calibration
-        MenuItem::Item {
-            label: "Calibrate Owner Now".into(),
-            cmd: MenuCmd::Command(IpcCommand::Calibrate),
-            checked: false,
-        },
-        MenuItem::Item {
-            label: "Auto-Calibrate Owner".into(),
-            cmd: MenuCmd::Command(IpcCommand::ToggleAutoCalibrate),
-            checked: state.auto_calibrate,
-        },
-        MenuItem::Item {
-            label: "Reset Tracking".into(),
-            cmd: MenuCmd::Command(IpcCommand::Reset),
-            checked: false,
-        },
-        MenuItem::Separator,
-        // Pause / Resume
-        pause_resume_item,
-        MenuItem::Separator,
-        // Quit
-        MenuItem::Item {
-            label: "Quit No-Peek".into(),
-            cmd: MenuCmd::Quit,
-            checked: false,
-        },
-    ]
+fn build(mtm: MainThreadMarker, target: &MenuTarget, items: &[MenuEntry]) -> Retained<NSMenu> {
+    let mut cmds = Vec::new();
+    let menu = build_level(mtm, target, items, &mut cmds);
+    CMDS.with(|c| *c.borrow_mut() = cmds);
+    menu
 }
 
-fn build(mtm: MainThreadMarker, target: &MenuTarget, items: &[MenuItem]) -> Retained<NSMenu> {
-    let mut cmds = Vec::new();
+fn build_level(
+    mtm: MainThreadMarker,
+    target: &MenuTarget,
+    items: &[MenuEntry],
+    cmds: &mut Vec<MenuCmd>,
+) -> Retained<NSMenu> {
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(""));
     menu.setAutoenablesItems(false);
-    for it in items {
-        match it {
-            MenuItem::Item {
-                label,
-                cmd,
+    for entry in items {
+        if matches!(entry, MenuEntry::Separator) {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+            continue;
+        }
+        let label = match entry {
+            MenuEntry::Info(label)
+            | MenuEntry::Action { label, .. }
+            | MenuEntry::Submenu { label, .. } => label,
+            MenuEntry::Separator => unreachable!("separator handled above"),
+        };
+        let action = if matches!(entry, MenuEntry::Action { .. }) {
+            Some(sel!(pick:))
+        } else {
+            None
+        };
+        let mi = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(label),
+                action,
+                &NSString::from_str(""),
+            )
+        };
+        match entry {
+            MenuEntry::Action {
+                action,
                 checked,
+                enabled,
+                ..
             } => {
-                let mi = unsafe {
-                    NSMenuItem::initWithTitle_action_keyEquivalent(
-                        NSMenuItem::alloc(mtm),
-                        &NSString::from_str(label),
-                        Some(sel!(pick:)),
-                        &NSString::from_str(""),
-                    )
-                };
                 let t: &AnyObject = target.as_ref();
                 unsafe { mi.setTarget(Some(t)) };
                 mi.setTag(cmds.len() as isize);
+                mi.setEnabled(*enabled);
                 mi.setState(if *checked {
                     NSControlStateValueOn
                 } else {
                     NSControlStateValueOff
                 });
-                cmds.push(*cmd);
-                menu.addItem(&mi);
+                cmds.push(*action);
             }
-            MenuItem::Info { label } => {
-                let mi = unsafe {
-                    NSMenuItem::initWithTitle_action_keyEquivalent(
-                        NSMenuItem::alloc(mtm),
-                        &NSString::from_str(label),
-                        None,
-                        &NSString::from_str(""),
-                    )
-                };
-                mi.setEnabled(false);
-                menu.addItem(&mi);
+            MenuEntry::Submenu { items, .. } => {
+                let child = build_level(mtm, target, items, cmds);
+                mi.setSubmenu(Some(&child));
             }
-            MenuItem::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
+            MenuEntry::Info(_) => mi.setEnabled(false),
+            MenuEntry::Separator => unreachable!("separator handled above"),
         }
+        menu.addItem(&mi);
     }
-    CMDS.with(|c| *c.borrow_mut() = cmds);
     menu
 }
 

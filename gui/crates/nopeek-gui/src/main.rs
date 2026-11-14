@@ -12,6 +12,8 @@ mod app;
 #[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
+mod settings;
+#[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod window;

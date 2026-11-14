@@ -145,6 +145,24 @@ pub fn drain_events() {
         while let Ok(event) = app.rx.try_recv() {
             match event {
                 AppEvent::Ipc(ipc_ev) => match ipc_ev {
+                    IpcEvent::PreviewFrame { .. } => {
+                        eprintln!("[nopeek-gui] Preview frame bypassed the worker mailbox");
+                    }
+                    IpcEvent::Settings {
+                        confidence,
+                        alert_after_s,
+                        escalated_after_s,
+                        preview,
+                        mirror,
+                    } => {
+                        app.tray_state.ready = true;
+                        app.tray_state.confidence = confidence;
+                        app.tray_state.alert_after_s = alert_after_s;
+                        app.tray_state.escalated_after_s = escalated_after_s;
+                        app.tray_state.preview = preview;
+                        app.tray_state.mirror = mirror;
+                        app.menubar.refresh(mtm, &app.tray_state);
+                    }
                     IpcEvent::Ready {
                         source, headless, ..
                     } => {
@@ -176,12 +194,16 @@ pub fn drain_events() {
                             "Searching Owner...".into()
                         };
 
-                        app.tray_state.status_text = match level {
-                            RiskLevel::Monitoring | RiskLevel::Pending => {
-                                format!("Status: Monitoring ({lock_str})")
+                        app.tray_state.status_text = if paused {
+                            "Deteksi dijeda".into()
+                        } else {
+                            match level {
+                                RiskLevel::Monitoring | RiskLevel::Pending => {
+                                    format!("Status: Monitoring ({lock_str})")
+                                }
+                                RiskLevel::Alert => format!("Status: Alert! ({message})"),
+                                RiskLevel::Escalated => format!("Status: DANGER! ({message})"),
                             }
-                            RiskLevel::Alert => format!("Status: Alert! ({message})"),
-                            RiskLevel::Escalated => format!("Status: DANGER! ({message})"),
                         };
 
                         let tip = match level {
@@ -235,21 +257,45 @@ pub fn drain_events() {
                     }
                     IpcEvent::Error { fatal, message } => {
                         eprintln!("[nopeek-gui] Worker error: fatal={fatal} | {message}");
+                        app.tray_state.status_text = format!("Error: {message}");
                         app.menubar
                             .update_tooltip(mtm, &format!("No-Peek Error: {message}"));
+                        app.menubar.refresh(mtm, &app.tray_state);
                     }
                 },
                 AppEvent::TrayCommand(cmd) => {
-                    let _ = app.worker.send_command(&cmd);
+                    if let Err(error) = app.worker.send_command(&cmd) {
+                        app.tray_state.status_text = format!("Perintah gagal: {error}");
+                        eprintln!("[nopeek-gui] Failed to send menu command: {error}");
+                        app.menubar.refresh(mtm, &app.tray_state);
+                    }
                 }
                 AppEvent::IpcExited { code } => {
                     eprintln!("[nopeek-gui] Python worker exited with code: {code:?}");
+                    app.tray_state.ready = false;
+                    app.tray_state.preview = false;
+                    app.tray_state.status_text = "Deteksi berhenti. Buka ulang No-Peek.".into();
+                    app.menubar.refresh(mtm, &app.tray_state);
                 }
                 AppEvent::Quit => {
+                    if let Err(error) = app.worker.shutdown() {
+                        eprintln!("[nopeek-gui] Failed to stop camera worker: {error}");
+                    }
                     let ns_app = NSApplication::sharedApplication(mtm);
                     ns_app.terminate(None);
                 }
+                AppEvent::PreviewAvailable => match app.worker.take_preview() {
+                    Ok(Some(frame)) => {
+                        if let Err(error) = crate::mac::settings::set_frame(frame) {
+                            eprintln!("[nopeek-gui] Preview rendering failed: {error}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("[nopeek-gui] Preview delivery failed: {error}"),
+                },
+                AppEvent::OpenSettings => crate::mac::settings::show(mtm, &app.tray_state),
             }
+            crate::mac::settings::refresh(mtm, &app.tray_state);
         }
     });
 }
@@ -259,6 +305,7 @@ pub fn on_menu(cmd: MenuCmd) {
     with_app(|app| match cmd {
         MenuCmd::Command(c) => app.sink.send(AppEvent::TrayCommand(c)),
         MenuCmd::Quit => app.sink.send(AppEvent::Quit),
+        MenuCmd::OpenSettings => app.sink.send(AppEvent::OpenSettings),
     });
 }
 
@@ -293,6 +340,7 @@ pub fn run(cfg: GuiConfig) -> Result<i32, String> {
         },
         auto_calibrate: true,
         paused: false,
+        ..Default::default()
     };
 
     let menubar = MenuBar::add(mtm, &tray_state);

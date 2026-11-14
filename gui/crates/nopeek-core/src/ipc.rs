@@ -42,6 +42,18 @@ pub struct ObserverSummary {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcEvent {
+    PreviewFrame {
+        width: u32,
+        height: u32,
+        pixels_hex: String,
+    },
+    Settings {
+        confidence: f32,
+        alert_after_s: f64,
+        escalated_after_s: f64,
+        preview: bool,
+        mirror: bool,
+    },
     Ready {
         version: String,
         source: String,
@@ -80,6 +92,11 @@ pub enum IpcEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum IpcCommand {
+    SetPreview { enabled: bool },
+    TogglePreview,
+    ToggleMirror,
+    SetConfidence { percent: u8 },
+    SetAlertDelay { seconds: u8 },
     Calibrate,
     ToggleAutoCalibrate,
     Reset,

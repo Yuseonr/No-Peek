@@ -90,6 +90,7 @@ impl App {
             },
             auto_calibrate: true,
             paused: false,
+            ..Default::default()
         };
 
         eprintln!("[nopeek-gui] Step 4: Adding System Tray icon...");
@@ -143,6 +144,23 @@ impl App {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 AppEvent::Ipc(ipc_ev) => match ipc_ev {
+                    IpcEvent::PreviewFrame { .. } => {
+                        eprintln!("[nopeek-gui] Preview frame bypassed the worker mailbox");
+                    }
+                    IpcEvent::Settings {
+                        confidence,
+                        alert_after_s,
+                        escalated_after_s,
+                        preview,
+                        mirror,
+                    } => {
+                        self.tray_state.ready = true;
+                        self.tray_state.confidence = confidence;
+                        self.tray_state.alert_after_s = alert_after_s;
+                        self.tray_state.escalated_after_s = escalated_after_s;
+                        self.tray_state.preview = preview;
+                        self.tray_state.mirror = mirror;
+                    }
                     IpcEvent::Ready {
                         source, headless, ..
                     } => {
@@ -173,15 +191,19 @@ impl App {
                             "Searching Owner...".into()
                         };
 
-                        self.tray_state.status_text = match level {
-                            RiskLevel::Monitoring | RiskLevel::Pending => {
-                                format!("Status: Monitoring ({lock_str})")
-                            }
-                            RiskLevel::Alert => {
-                                format!("Status: Alert! ({message})")
-                            }
-                            RiskLevel::Escalated => {
-                                format!("Status: DANGER! ({message})")
+                        self.tray_state.status_text = if paused {
+                            "Deteksi dijeda".into()
+                        } else {
+                            match level {
+                                RiskLevel::Monitoring | RiskLevel::Pending => {
+                                    format!("Status: Monitoring ({lock_str})")
+                                }
+                                RiskLevel::Alert => {
+                                    format!("Status: Alert! ({message})")
+                                }
+                                RiskLevel::Escalated => {
+                                    format!("Status: DANGER! ({message})")
+                                }
                             }
                         };
 
@@ -207,18 +229,45 @@ impl App {
                     }
                     IpcEvent::Error { fatal, message } => {
                         eprintln!("[nopeek-gui] Worker error: fatal={fatal} | {message}");
+                        self.tray_state.status_text = format!("Error: {message}");
                         self.update_tray_tooltip(&format!("No-Peek Error: {message}"));
                     }
                 },
                 AppEvent::TrayCommand(cmd) => {
-                    let _ = self.worker.send_command(&cmd);
+                    if let Err(error) = self.worker.send_command(&cmd) {
+                        self.tray_state.status_text = format!("Perintah gagal: {error}");
+                        eprintln!("[nopeek-gui] Failed to send menu command: {error}");
+                    }
                 }
                 AppEvent::IpcExited { code } => {
                     eprintln!("[nopeek-gui] Python worker exited with code: {code:?}");
+                    self.tray_state.ready = false;
+                    self.tray_state.preview = false;
+                    self.tray_state.status_text = "Deteksi berhenti. Buka ulang No-Peek.".into();
                 }
                 AppEvent::Quit => unsafe {
                     PostQuitMessage(0);
                 },
+                AppEvent::PreviewAvailable => match self.worker.take_preview() {
+                    Ok(Some(frame)) => {
+                        if let Err(error) = crate::settings::set_frame(frame) {
+                            eprintln!("[nopeek-gui] Preview rendering failed: {error}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("[nopeek-gui] Preview delivery failed: {error}"),
+                },
+                AppEvent::OpenSettings => {
+                    if let Err(error) =
+                        crate::settings::show(self.helper_hwnd, &self.tray_state, self.sink.clone())
+                    {
+                        self.tray_state.status_text = format!("Gagal membuka pengaturan: {error}");
+                        eprintln!("[nopeek-gui] Failed to open settings panel: {error}");
+                    }
+                }
+            }
+            if let Err(error) = crate::settings::refresh(&self.tray_state) {
+                eprintln!("[nopeek-gui] Failed to update settings panel: {error}");
             }
         }
     }
@@ -252,12 +301,14 @@ impl App {
                     TrayAction::Quit => {
                         self.sink.send(AppEvent::Quit);
                     }
+                    TrayAction::OpenSettings => self.sink.send(AppEvent::OpenSettings),
                 }
             }
         }
     }
 
     pub fn shutdown(mut self) -> i32 {
+        crate::settings::close();
         if let Some(tray) = self.tray.take() {
             tray.remove();
         }
@@ -349,6 +400,9 @@ pub fn run(cfg: GuiConfig) -> Result<i32> {
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if crate::settings::translate_dialog_message(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

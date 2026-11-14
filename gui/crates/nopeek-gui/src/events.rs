@@ -40,9 +40,13 @@ pub enum AppEvent {
     /// Inbound IPC event from Python Inference worker
     Ipc(IpcEvent),
     /// Notification that the Python worker process exited
-    IpcExited { code: Option<i32> },
+    IpcExited {
+        code: Option<i32>,
+    },
     /// Outbound command triggered from System Tray or Menu Bar
     TrayCommand(IpcCommand),
+    OpenSettings,
+    PreviewAvailable,
     /// Request to quit the application
     Quit,
 }

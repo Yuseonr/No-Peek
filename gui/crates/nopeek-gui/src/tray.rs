@@ -2,7 +2,8 @@
 //! Adapted from `oyenza-studio/crates/poni/src/tray.rs`.
 
 use crate::events::WM_APP_TRAY;
-use nopeek_core::ipc::IpcCommand;
+use nopeek_core::controls::{menu as menu_entries, MenuEntry};
+pub use nopeek_core::controls::{MenuAction as TrayAction, TrayState};
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
@@ -68,99 +69,71 @@ impl Tray {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct TrayState {
-    pub status_text: String,
-    pub mode_text: String,
-    pub auto_calibrate: bool,
-    pub paused: bool,
+struct Popup(HMENU);
+impl Drop for Popup {
+    fn drop(&mut self) {
+        if let Err(error) = unsafe { DestroyMenu(self.0) } {
+            eprintln!("[nopeek-gui] Failed to release menu: {error}");
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrayAction {
-    Command(IpcCommand),
-    Quit,
+fn build_menu(items: &[MenuEntry], actions: &mut Vec<TrayAction>) -> Result<Popup> {
+    let popup = Popup(unsafe { CreatePopupMenu()? });
+    for entry in items {
+        unsafe {
+            match entry {
+                MenuEntry::Separator => AppendMenuW(popup.0, MF_SEPARATOR, 0, PCWSTR::null())?,
+                MenuEntry::Info(label) => {
+                    let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                    AppendMenuW(popup.0, MF_STRING | MF_GRAYED, 0, PCWSTR(wide.as_ptr()))?;
+                }
+                MenuEntry::Action {
+                    label,
+                    action,
+                    checked,
+                    enabled,
+                } => {
+                    actions.push(*action);
+                    let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                    let flags = MF_STRING
+                        | if *checked { MF_CHECKED } else { MF_UNCHECKED }
+                        | if *enabled { MF_ENABLED } else { MF_GRAYED };
+                    AppendMenuW(popup.0, flags, actions.len(), PCWSTR(wide.as_ptr()))?;
+                }
+                MenuEntry::Submenu { label, items } => {
+                    let child = build_menu(items, actions)?;
+                    let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                    AppendMenuW(
+                        popup.0,
+                        MF_STRING | MF_POPUP,
+                        child.0 .0 as usize,
+                        PCWSTR(wide.as_ptr()),
+                    )?;
+                    std::mem::forget(child);
+                }
+            }
+        }
+    }
+    Ok(popup)
 }
 
 pub fn show_context_menu(owner: HWND, pt: POINT, state: &TrayState) -> Option<TrayAction> {
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        let mut actions: Vec<TrayAction> = Vec::new();
-
-        // Helper closures to append items
-        let append_info = |hmenu: HMENU, text: &str| {
-            let w: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-            let _ = AppendMenuW(
-                hmenu,
-                MF_STRING | MF_GRAYED | MF_DISABLED,
-                0,
-                PCWSTR(w.as_ptr()),
-            );
-        };
-
-        let mut append_item = |hmenu: HMENU, label: &str, action: TrayAction, checked: bool| {
-            actions.push(action);
-            let id = actions.len();
-            let w: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
-            let flags = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
-            let _ = AppendMenuW(hmenu, flags, id, PCWSTR(w.as_ptr()));
-        };
-
-        let append_sep = |hmenu: HMENU| {
-            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
-        };
-
-        // Status lines (info)
-        append_info(menu, &state.status_text);
-        append_info(menu, &state.mode_text);
-        append_sep(menu);
-
-        // Calibration commands
-        append_item(
-            menu,
-            "Calibrate Owner Now",
-            TrayAction::Command(IpcCommand::Calibrate),
-            false,
-        );
-        append_item(
-            menu,
-            "Auto-Calibrate Owner",
-            TrayAction::Command(IpcCommand::ToggleAutoCalibrate),
-            state.auto_calibrate,
-        );
-        append_item(
-            menu,
-            "Reset Tracking",
-            TrayAction::Command(IpcCommand::Reset),
-            false,
-        );
-        append_sep(menu);
-
-        // Pause / Resume
-        if state.paused {
-            append_item(
-                menu,
-                "Resume Detection",
-                TrayAction::Command(IpcCommand::Resume),
-                false,
-            );
-        } else {
-            append_item(
-                menu,
-                "Pause Detection",
-                TrayAction::Command(IpcCommand::Pause),
-                false,
-            );
+    let mut actions = Vec::new();
+    let popup = match build_menu(&menu_entries(state), &mut actions) {
+        Ok(menu) => menu,
+        Err(error) => {
+            eprintln!("[nopeek-gui] Failed to build settings menu: {error}");
+            return None;
         }
-        append_sep(menu);
-
-        // Quit
-        append_item(menu, "Quit No-Peek", TrayAction::Quit, false);
-
+    };
+    unsafe {
         let prev = GetForegroundWindow();
-        let _ = SetForegroundWindow(owner);
+        if !SetForegroundWindow(owner).as_bool() {
+            eprintln!("[nopeek-gui] Windows declined menu foreground activation");
+        }
         let chosen = TrackPopupMenu(
-            menu,
+            popup.0,
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
             pt.x,
             pt.y,
@@ -168,19 +141,18 @@ pub fn show_context_menu(owner: HWND, pt: POINT, state: &TrayState) -> Option<Tr
             owner,
             None,
         );
-        let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-
-        if !prev.is_invalid() && prev != owner && IsWindow(prev).as_bool() {
-            let _ = SetForegroundWindow(prev);
+        if let Err(error) = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0)) {
+            eprintln!("[nopeek-gui] Failed to dismiss menu focus: {error}");
         }
-
-        let idx = chosen.0 as usize;
-        if idx == 0 {
-            None
-        } else {
-            actions.get(idx - 1).copied()
+        if !prev.is_invalid()
+            && prev != owner
+            && IsWindow(prev).as_bool()
+            && !SetForegroundWindow(prev).as_bool()
+        {
+            eprintln!("[nopeek-gui] Windows declined restoring foreground window");
         }
+        let index = chosen.0 as usize;
+        index.checked_sub(1).and_then(|i| actions.get(i).copied())
     }
 }
 

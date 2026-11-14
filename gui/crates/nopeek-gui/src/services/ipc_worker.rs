@@ -5,6 +5,7 @@
 use crate::events::{AppEvent, EventSink};
 use nopeek_core::config::{EnvMode, GuiConfig};
 use nopeek_core::ipc::{IpcCommand, IpcEvent};
+use nopeek_core::preview::{PreviewFrame, PreviewMailbox};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -33,6 +34,7 @@ pub struct IpcWorker {
     #[cfg(windows)]
     job_handle: Option<HANDLE>,
     child_handle: Arc<Mutex<Option<Child>>>,
+    preview: Arc<PreviewMailbox>,
 }
 
 impl IpcWorker {
@@ -83,9 +85,15 @@ impl IpcWorker {
                 }
             }
         }
-        cmd.args(["-m", "no_peek.main", "--ipc", "stdio"]);
+        cmd.args([
+            "-m",
+            "no_peek.main",
+            "--ipc",
+            "stdio",
+            "--desktop",
+            "--headless",
+        ]);
         if cfg.env_mode == EnvMode::Prod {
-            cmd.arg("--headless");
             cmd.stderr(Stdio::null());
         } else {
             cmd.stderr(Stdio::inherit());
@@ -139,10 +147,12 @@ impl IpcWorker {
         let stdout = child.stdout.take();
         let stdin_holder = Arc::new(Mutex::new(stdin));
         let child_holder = Arc::new(Mutex::new(Some(child)));
+        let preview = Arc::new(PreviewMailbox::default());
 
         // Reader thread: consumes JSON lines from child.stdout
         if let Some(out) = stdout {
             let reader_sink = sink.clone();
+            let frames = Arc::clone(&preview);
             thread::Builder::new()
                 .name("nopeek-ipc-reader".into())
                 .spawn(move || {
@@ -155,12 +165,19 @@ impl IpcWorker {
                                     continue;
                                 }
                                 match IpcEvent::parse_line(trimmed) {
+                                    Ok(IpcEvent::PreviewFrame { width, height, pixels_hex }) => {
+                                        match PreviewFrame::decode(width, height, &pixels_hex).and_then(|frame| frames.put(frame)) {
+                                            Ok(true) => reader_sink.send(AppEvent::PreviewAvailable),
+                                            Ok(false) => {},
+                                            Err(error) => eprintln!("[nopeek-gui] Invalid preview frame: {error}"),
+                                        }
+                                    }
                                     Ok(event) => {
                                         eprintln!("[ipc_reader] Received event: {event:?}");
                                         reader_sink.send(AppEvent::Ipc(event));
                                     }
                                     Err(e) => {
-                                        eprintln!("[nopeek-gui] failed to parse JSON line: {e} | line: {trimmed}");
+                                        eprintln!("[nopeek-gui] failed to parse IPC message ({} bytes): {e}", trimmed.len());
                                     }
                                 }
                             }
@@ -197,7 +214,12 @@ impl IpcWorker {
             #[cfg(windows)]
             job_handle,
             child_handle: child_holder,
+            preview,
         })
+    }
+
+    pub fn take_preview(&self) -> Result<Option<PreviewFrame>, String> {
+        self.preview.take()
     }
 
     /// Send an IPC command to the Python worker via stdin.
@@ -210,24 +232,37 @@ impl IpcWorker {
         }
         Ok(())
     }
+
+    pub fn shutdown(&mut self) -> std::io::Result<()> {
+        if let Err(error) = self.send_command(&IpcCommand::Quit) {
+            eprintln!("[nopeek-gui] Worker quit command failed; ensuring cleanup: {error}");
+        }
+        let mut lock = self.child_handle.lock().map_err(|error| {
+            std::io::Error::other(format!("Worker process lock poisoned: {error}"))
+        })?;
+        if let Some(child) = lock.as_mut() {
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
+            child.wait()?;
+            *lock = None;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for IpcWorker {
     fn drop(&mut self) {
-        // Send quit command to child
-        let _ = self.send_command(&IpcCommand::Quit);
+        if let Err(error) = self.shutdown() {
+            eprintln!("[nopeek-gui] Worker cleanup failed: {error}");
+        }
 
         #[cfg(windows)]
         if let Some(job) = self.job_handle.take() {
             unsafe {
-                let _ = CloseHandle(job);
-            }
-        }
-
-        // Ensure child process terminates
-        if let Ok(mut lock) = self.child_handle.lock() {
-            if let Some(mut c) = lock.take() {
-                let _ = c.kill();
+                if let Err(error) = CloseHandle(job) {
+                    eprintln!("[nopeek-gui] Failed to close worker job: {error}");
+                }
             }
         }
     }

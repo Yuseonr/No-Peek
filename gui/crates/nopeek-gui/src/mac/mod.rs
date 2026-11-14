@@ -4,4 +4,5 @@ pub mod app;
 pub mod gfx;
 pub mod menubar;
 pub mod notch;
+pub mod settings;
 pub mod window;

@@ -33,7 +33,7 @@ def format_alert_message(
     zone_str = "/".join(zones) if zones else "Belakang"
 
     if level == "ESCALATED":
-        secs = max(7, int(max_risk_s))
+        secs = max(0, int(max_risk_s))
         if count > 1:
             return f"{base_escalated_text} ({count} Orang - {zone_str}, {secs}d+)"
         return f"{base_escalated_text} ({zone_str}, {secs}d+)"
@@ -116,6 +116,7 @@ class IpcChannel:
         self._in = in_stream or sys.stdin
         self._commands: deque[dict] = deque()
         self._lock = threading.Lock()
+        self._command_available = threading.Event()
         self._last_signature: tuple | None = None
         self._last_heartbeat: float = 0.0
         self._reader_thread: threading.Thread | None = None
@@ -141,6 +142,7 @@ class IpcChannel:
                     if isinstance(cmd, dict) and "cmd" in cmd:
                         with self._lock:
                             self._commands.append(cmd)
+                            self._command_available.set()
                 except json.JSONDecodeError:
                     continue
         except (OSError, ValueError):
@@ -149,7 +151,13 @@ class IpcChannel:
     def poll_command(self) -> dict | None:
         """Ambil satu perintah dari antrean masuk (non-blocking)."""
         with self._lock:
-            return self._commands.popleft() if self._commands else None
+            command = self._commands.popleft() if self._commands else None
+            if not self._commands:
+                self._command_available.clear()
+            return command
+
+    def wait_for_command(self, timeout: float) -> None:
+        self._command_available.wait(timeout)
 
     def send(self, payload: dict) -> None:
         """Kirim satu baris JSON ke Rust dan langsung flush."""
@@ -180,3 +188,4 @@ class IpcChannel:
     def close(self) -> None:
         """Hentikan pembaca IPC."""
         self._stopped = True
+        self._command_available.set()

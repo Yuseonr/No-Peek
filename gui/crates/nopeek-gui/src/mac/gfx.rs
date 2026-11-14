@@ -729,6 +729,19 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
+    pub fn from_preview(frame: &nopeek_core::preview::PreviewFrame) -> Result<Self, String> {
+        frame.validate()?;
+        let bitmap = Self::new(frame.width as usize, frame.height as usize, 1.0)
+            .ok_or_else(|| "Could not allocate preview bitmap".to_string())?;
+        let data = objc2_core_graphics::CGBitmapContextGetData(Some(&bitmap.ctx));
+        if data.is_null() {
+            return Err("Preview bitmap has no writable pixel storage".into());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(frame.bgra.as_ptr(), data.cast(), frame.bgra.len())
+        };
+        Ok(bitmap)
+    }
     pub fn new(w: usize, h: usize, scale: f32) -> Option<Self> {
         let srgb = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))?;
         let info = CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0;
@@ -751,6 +764,23 @@ impl Bitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_bitmap_preserves_bgra_pixels_and_rejects_invalid_storage() {
+        let frame = nopeek_core::preview::PreviewFrame::decode(2, 1, "ff0000ff0000ffff").unwrap();
+        let bitmap = Bitmap::from_preview(&frame).unwrap();
+        let pointer = objc2_core_graphics::CGBitmapContextGetData(Some(bitmap.ctx()));
+        assert!(!pointer.is_null());
+        let pixels = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), frame.bgra.len()) };
+        assert_eq!(pixels, frame.bgra);
+        assert!(bitmap.image().is_some());
+        let invalid = nopeek_core::preview::PreviewFrame {
+            width: 1,
+            height: 1,
+            bgra: vec![0; 100],
+        };
+        assert!(Bitmap::from_preview(&invalid).is_err());
+    }
 
     #[test]
     fn matrix3x2_identity() {
